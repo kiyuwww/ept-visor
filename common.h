@@ -1,9 +1,3 @@
-// ============================================================================
-//  common.h — shared architecture constants, structures, and inline helpers.
-//  Supports BOTH Intel VT-x/EPT and AMD SVM/NPT. The file has no vendor
-//  conditional compilation: all constants coexist, and vendor-specific
-//  code selects the right subset at runtime.
-// ============================================================================
 #pragma once
 
 #include <ntddk.h>
@@ -11,7 +5,7 @@
 #include <stdint.h>
 
 // ============================================================================
-//  1. MSRs — Intel VT-x
+//  1. MSRs - Intel VT-x
 // ============================================================================
 #define MSR_IA32_FEATURE_CONTROL        0x0000003A
 #define MSR_IA32_VMX_BASIC              0x00000480
@@ -28,12 +22,17 @@
 #define MSR_IA32_VMX_EPT_VPID_CAP       0x0000048C
 
 // ============================================================================
-//  2. MSRs — generic x64 / AMD SVM
+//  2. MSRs - generic x64 / AMD SVM
 // ============================================================================
 #define MSR_IA32_EFER                   0xC0000080
 #define MSR_IA32_STAR                   0xC0000081
 #define MSR_IA32_LSTAR                  0xC0000082
+#define MSR_IA32_CSTAR                  0xC0000083
 #define MSR_IA32_FMASK                  0xC0000084
+#define MSR_IA32_SFMASK                 0xC0000084
+#define MSR_IA32_SYSENTER_CS            0x00000174
+#define MSR_IA32_SYSENTER_ESP           0x00000175
+#define MSR_IA32_SYSENTER_EIP           0x00000176
 #define MSR_IA32_FS_BASE                0xC0000100
 #define MSR_IA32_GS_BASE                0xC0000101
 #define MSR_IA32_KERNEL_GS_BASE         0xC0000102
@@ -78,7 +77,7 @@
 // IA32_FEATURE_CONTROL bits
 #define FC_LOCK                         (1ULL <<  0)
 #define FC_VMXON_SMX                    (1ULL <<  1)
-#define FC_VMXON_IN_SM                  (1ULL <<  2)
+#define FC_VMXON_OUTSIDE_SMX            (1ULL <<  2)
 
 // ============================================================================
 //  4. VMCS field encodings (Intel SDM Vol 3C App. B)
@@ -202,7 +201,7 @@
 #define VMCS_HOST_RIP                        0x6C16
 
 // ============================================================================
-//  5. VMX execution controls (Intel SDM Vol 3C Tables 24-x)
+//  5. VMX execution controls (Intel SDM Vol 3C Tables 24-x / 25-7)
 // ============================================================================
 // Pin-based
 #define PIN_BASED_EXT_INTR_EXITING       (1U << 0)
@@ -211,16 +210,16 @@
 #define PIN_BASED_PREEMPT_TIMER          (1U << 6)
 // Primary processor-based
 #define CPU_BASED_HLT_EXITING            (1U <<  7)
-#define CPU_BASED_INVLPG_EXITING         (1U << 10)
-#define CPU_BASED_MWAIT_EXITING          (1U << 11)
-#define CPU_BASED_RDPMC_EXITING          (1U << 12)
-#define CPU_BASED_RDTSC_EXITING          (1U << 13)
+#define CPU_BASED_INVLPG_EXITING         (1U <<  9)
+#define CPU_BASED_MWAIT_EXITING          (1U << 10)
+#define CPU_BASED_RDPMC_EXITING          (1U << 11)
+#define CPU_BASED_RDTSC_EXITING          (1U << 12)
 #define CPU_BASED_CR3_LOAD_EXITING       (1U << 15)
 #define CPU_BASED_CR3_STORE_EXITING      (1U << 16)
 #define CPU_BASED_MOV_DR_EXITING         (1U << 23)
 #define CPU_BASED_UNCOND_IO_EXITING      (1U << 24)
 #define CPU_BASED_USE_IO_BITMAPS         (1U << 25)
-#define CPU_BASED_MONITOR_TRAP_FLAG      (1U << 26)   // MTF — bit 26 (SDM)
+#define CPU_BASED_MONITOR_TRAP_FLAG      (1U << 27)
 #define CPU_BASED_USE_MSR_BITMAPS        (1U << 28)
 #define CPU_BASED_ACTIVATE_SECONDARY     (1U << 31)
 // Secondary processor-based
@@ -321,7 +320,7 @@
 #define SVM_INTERCEPT_CR14_WRITE         (1U << 30)
 #define SVM_INTERCEPT_CR15_WRITE         (1U << 31)
 
-// VMCB offset 0x004 — misc intercepts
+// VMCB offset 0x004 - misc intercepts
 #define SVM_INTERCEPT_INTR               (1U <<  0)
 #define SVM_INTERCEPT_NMI                (1U <<  1)
 #define SVM_INTERCEPT_SMI                (1U <<  2)
@@ -355,7 +354,7 @@
 #define SVM_INTERCEPT_FERR_FREEZE        (1U << 30)
 #define SVM_INTERCEPT_SHUTDOWN           (1U << 31)
 
-// VMCB offset 0x008 — misc intercepts 2 (AMD APM Vol 2, App. B)
+// VMCB offset 0x008 - misc intercepts 2
 #define SVM_INTERCEPT_VMRUN              (1ULL <<  0)
 #define SVM_INTERCEPT_VMMCALL            (1ULL <<  1)
 #define SVM_INTERCEPT_VMLOAD             (1ULL <<  2)
@@ -397,7 +396,7 @@
 #define VMCB_CTRL_NRIP                  0x0C8
 #define VMCB_CTRL_NINST_RET             0x0D0
 
-// VMCB save-state offsets
+// VMCB save-state offsets (AMD APM Volume 2 Appendix B)
 #define VMCB_SAVE_ES_SEL                0x400
 #define VMCB_SAVE_CS_SEL                0x410
 #define VMCB_SAVE_SS_SEL                0x420
@@ -408,27 +407,40 @@
 #define VMCB_SAVE_LDTR_SEL              0x470
 #define VMCB_SAVE_IDTR_SEL              0x480
 #define VMCB_SAVE_TR_SEL                0x490
-#define VMCB_SAVE_CPL                   (VMCB_SAVE_CS_SEL + 0xB)
+#define VMCB_SAVE_CPL                   (VMCB_SAVE_CS_SEL + 0xBB)
+#define VMCB_SAVE_EFER                  0x4D0
+#define VMCB_SAVE_CR4                   0x548
+#define VMCB_SAVE_CR3                   0x550
 #define VMCB_SAVE_CR0                   0x558
 #define VMCB_SAVE_CR2                   0x560
-#define VMCB_SAVE_CR3                   0x568
-#define VMCB_SAVE_CR4                   0x570
-#define VMCB_SAVE_EFER                  0x5D0
-#define VMCB_SAVE_RFLAGS                0x570 /* historical; real = 0x5D8 */
-#define VMCB_SAVE_RSP                   0x5D8
-#define VMCB_SAVE_RIP                   0x5E0
-#define VMCB_SAVE_RAX                   0x5F8
+#define VMCB_SAVE_DR6                   0x568
+#define VMCB_SAVE_DR7                   0x570
+#define VMCB_SAVE_RIP                   0x578
+#define VMCB_SAVE_RSP                   0x5D0
+#define VMCB_SAVE_RFLAGS                0x5D8
+#define VMCB_SAVE_RAX                   0x5E0
+#define VMCB_SAVE_STAR                  0x5E8
+#define VMCB_SAVE_LSTAR                 0x5F0
+#define VMCB_SAVE_CSTAR                 0x5F8
+#define VMCB_SAVE_SFMASK                0x600
+#define VMCB_SAVE_KERNEL_GS_BASE        0x608
+#define VMCB_SAVE_SYSENTER_CS           0x610
+#define VMCB_SAVE_SYSENTER_ESP          0x618
+#define VMCB_SAVE_SYSENTER_EIP          0x620
+#define VMCB_SAVE_G_PAT                 0x640
 
 // AMD exit codes
 #define SVM_EXIT_READ_CR0               0x000
-#define SVM_EXIT_WRITE_CR0              0x010
+#define SVM_EXIT_READ_CR2               0x002
 #define SVM_EXIT_READ_CR3               0x003
-#define SVM_EXIT_WRITE_CR3              0x013
 #define SVM_EXIT_READ_CR4               0x004
+#define SVM_EXIT_WRITE_CR0              0x010
+#define SVM_EXIT_WRITE_CR2              0x012
+#define SVM_EXIT_WRITE_CR3              0x013
 #define SVM_EXIT_WRITE_CR4              0x014
 #define SVM_EXIT_READ_DR0               0x020
 #define SVM_EXIT_WRITE_DR0              0x030
-#define SVM_EXIT_EXCP_BASE              0x040   // + vector
+#define SVM_EXIT_EXCP_BASE              0x040
 #define SVM_EXIT_INTR                   0x060
 #define SVM_EXIT_NMI                    0x061
 #define SVM_EXIT_SMI                    0x062
@@ -465,7 +477,7 @@
 
 #define EPT_MEMTYPE_UC                  (0ULL << 3)
 #define EPT_MEMTYPE_WC                  (1ULL << 3)
-#define EPT_MEMTYPE_WB                  (6ULL << 3)   // standard for RAM
+#define EPT_MEMTYPE_WB                  (6ULL << 3)
 
 #define NPT_PERM_READ                   (1ULL << 0)
 #define NPT_PERM_WRITE                  (1ULL << 1)
@@ -484,24 +496,22 @@
 typedef union _EPT_ENTRY {
     UINT64 Value;
     struct {
-        UINT64 Read        : 1;   // bit 0
-        UINT64 Write       : 1;   // bit 1
-        UINT64 Execute     : 1;   // bit 2
-        UINT64 MemType     : 3;   // bits 3..5 (WB = 6)
-        UINT64 IgnorePat   : 1;   // bit 6
-        UINT64 LargePage   : 1;   // bit 7 (PDE/2MB)
-        UINT64 Accessed    : 1;   // bit 8
-        UINT64 Dirty       : 1;   // bit 9 (PTE only)
-        UINT64 UserExec    : 1;   // bit 10
-        UINT64 Reserved0   : 1;   // bit 11
-        UINT64 PhysAddr    : 40;  // bits 12..51
-        UINT64 Reserved1   : 11;  // bits 52..62
-        UINT64 SuppressVe  : 1;   // bit 63 (Intel only; NPT leaves 0)
+        UINT64 Read        : 1;
+        UINT64 Write       : 1;
+        UINT64 Execute     : 1;
+        UINT64 MemType     : 3;
+        UINT64 IgnorePat   : 1;
+        UINT64 LargePage   : 1;
+        UINT64 Accessed    : 1;
+        UINT64 Dirty       : 1;
+        UINT64 UserExec    : 1;
+        UINT64 Reserved0   : 1;
+        UINT64 PhysAddr    : 40;
+        UINT64 Reserved1   : 11;
+        UINT64 SuppressVe  : 1;
     } Fields;
 } EPT_ENTRY, *PEPT_ENTRY;
-#pragma pack(pop)
 
-#pragma pack(push, 1)
 typedef struct _DESCRIPTOR_TABLE_REGISTER64 {
     UINT16 Limit;
     UINT64 Base;
@@ -527,25 +537,42 @@ typedef struct _SEGMENT_DESCRIPTOR64 {
 #define AR_UNUSABLE                     (1U << 16)
 
 // ============================================================================
-//  10. Dynamic identity-map range (replaces hardcoded 1 GB)
+//  10. Dynamic identity-map range
 // ============================================================================
 typedef struct _HV_IDENTITY_RANGE {
-    UINT64 Base;    // 4 KB-aligned start of the range
-    UINT64 Size;    // multiple of 4 KB
+    UINT64 Base;
+    UINT64 Size;
 } HV_IDENTITY_RANGE, *PHV_IDENTITY_RANGE;
 
 // ============================================================================
 //  11. Pre-allocated 4 KB page table pool
 // ============================================================================
-#define HV_PT_POOL_MAX_PAGES            1024
+#define HV_PT_POOL_MAX_PAGES            4096
+#define HV_PT_POOL_GUARD_QWORDS         8
+#define HV_PT_POOL_GUARD_COOKIE         0x48565054504F4F4CULL
 
-typedef struct _HV_PT_POOL {
+typedef struct __declspec(align(64)) _HV_PT_POOL {
     PVOID        Pages[HV_PT_POOL_MAX_PAGES];
     UINT64       Phys[HV_PT_POOL_MAX_PAGES];
-    volatile LONG Top;                 // current number of free pages
-    volatile LONG Lock;                // any-IRQL spinlock
+    volatile LONG Top;
+    volatile LONG Lock;
+    volatile LONG FaultCount;
+    UINT64       GuardCookie;
+    UINT64       Guard[HV_PT_POOL_GUARD_QWORDS];
     BOOLEAN      Initialized;
 } HV_PT_POOL, *PHV_PT_POOL;
+
+static __forceinline BOOLEAN HvPtPoolIndexValid(LONG Index)
+{
+    return (Index >= 0) && (Index < HV_PT_POOL_MAX_PAGES);
+}
+
+static __forceinline BOOLEAN HvPtPoolValidate(PHV_PT_POOL Pool)
+{
+    return (Pool != NULL) &&
+           (Pool->Initialized != FALSE) &&
+           (Pool->GuardCookie == HV_PT_POOL_GUARD_COOKIE);
+}
 
 // ============================================================================
 //  12. Protected range (anti-cheat policy)
@@ -562,9 +589,10 @@ typedef struct _PROTECTED_RANGE {
 // ============================================================================
 //  13. Per-CPU context (vendor-agnostic layout)
 // ============================================================================
-#define VMX_HOST_STACK_SIZE             (16 * 1024)
+#define VMX_HOST_STACK_SIZE             (64 * 1024)
+#define HV_CPU_STATE_FENCE()            _ReadWriteBarrier()
 
-typedef struct _PER_CPU_CONTEXT {
+typedef struct __declspec(align(64)) _PER_CPU_CONTEXT {
     ULONG   CpuIndex;
 
     // Intel
@@ -584,18 +612,18 @@ typedef struct _PER_CPU_CONTEXT {
     // Common
     PVOID   HostStack;
     UINT64  HostStackTop;
-    BOOLEAN Launched;
+    volatile BOOLEAN Launched;
 
     // Single-step pending state (MTF on Intel / RFLAGS.TF on AMD)
-    BOOLEAN SingleStepPending;
-    UINT64  PendingGpa;
-    UINT64  PendingOrigVal;
+    volatile BOOLEAN SingleStepPending;
+    volatile UINT64  PendingGpa;
+    volatile UINT64  PendingOrigVal;
 
     UINT64  Reserved[4];
 } PER_CPU_CONTEXT, *PPER_CPU_CONTEXT;
 
 // ============================================================================
-//  14. Abstract runtime interface — vendor dispatch
+//  14. Abstract runtime interface - vendor dispatch
 // ============================================================================
 typedef enum _HV_VENDOR {
     HvVendorUnknown = 0,
@@ -622,8 +650,8 @@ typedef struct _HV_OPERATIONS {
     VOID     (*ArmSingleStep)(PPER_CPU_CONTEXT Cpu);
     VOID     (*DisarmSingleStep)(PPER_CPU_CONTEXT Cpu);
 
-    // Exception injection (for #PF on pool depletion)
-    VOID     (*InjectException)(UINT32 Vector, UINT32 ErrorCode, UINT64 FaultingGpa);
+    // Exception injection
+    NTSTATUS (*InjectException)(UINT32 Vector, UINT32 ErrorCode, UINT64 FaultingGpa);
 
     // TLB maintenance
     VOID     (*InvalidateTlbAll)(VOID);
@@ -645,58 +673,141 @@ extern ULONG            g_IdentityRangeCount;
 //  16. Inline helpers
 // ============================================================================
 
-// Any-IRQL spinlock (safe inside VM-exit)
+// Any-IRQL spinlock safe inside VM-exit context.
 static __forceinline void SpinAcquire(volatile LONG* Lock)
 {
     while (_InterlockedCompareExchange(Lock, 1, 0) != 0)
         _mm_pause();
     _ReadWriteBarrier();
 }
+
 static __forceinline void SpinRelease(volatile LONG* Lock)
 {
     _ReadWriteBarrier();
     _InterlockedExchange(Lock, 0);
 }
 
-// VMCS accessors — usable from any TU
-static __forceinline UINT64 VmRead64(UINT64 f) { UINT64 v = 0; __vmx_vmread(f, &v); return v; }
-static __forceinline UINT32 VmRead32(UINT64 f) { return (UINT32)VmRead64(f); }
-static __forceinline UINT16 VmRead16(UINT64 f) { return (UINT16)VmRead64(f); }
-static __forceinline void   VmWrite64(UINT64 f, UINT64 v) { __vmx_vmwrite(f, v); }
-static __forceinline void   VmWrite32(UINT64 f, UINT32 v) { __vmx_vmwrite(f, (UINT64)v); }
-static __forceinline void   VmWrite16(UINT64 f, UINT16 v) { __vmx_vmwrite(f, (UINT64)v); }
+// VMCS accessors evaluate the architectural status byte returned by the
+// compiler intrinsics. A non-zero status is a programming or hardware
+// interface failure and is asserted in debug builds.
+#define HV_VMX_STATUS_ASSERT(Status) NT_ASSERT((Status) == 0)
 
-// ---------------------------------------------------------------------------
-//  VmxAdjustControls — correct SDM Vol 3C App. B semantics.
-//  caps[63:32] = allowed-to-be-1 (must-be-1 if we want the feature),
-//  caps[31:0]  = allowed-to-be-0 (must be 0 in our controls).
-//  The previous implementation was inverted: it cleared bits that were
-//  permitted. This version follows KVM's vmx_exec_control() exactly:
-//     ctl &= caps_hi;   // must-be-0 mask
-//     ctl |= caps_lo;   // must-be-1 mask
-// ---------------------------------------------------------------------------
+static __forceinline unsigned char VmRead64Status(UINT64 Field, UINT64* Value)
+{
+    unsigned char status = __vmx_vmread(Field, Value);
+    if (status != 0)
+        HV_VMX_STATUS_ASSERT(status);
+    return status;
+}
+
+static __forceinline unsigned char VmWrite64Status(UINT64 Field, UINT64 Value)
+{
+    unsigned char status = __vmx_vmwrite(Field, Value);
+    if (status != 0)
+        HV_VMX_STATUS_ASSERT(status);
+    return status;
+}
+
+static __forceinline unsigned char VmRead32Status(UINT64 Field, UINT32* Value)
+{
+    UINT64 tmp = 0;
+    unsigned char status = VmRead64Status(Field, &tmp);
+    if (status == 0 && Value != NULL)
+        *Value = (UINT32)tmp;
+    return status;
+}
+
+static __forceinline unsigned char VmRead16Status(UINT64 Field, UINT16* Value)
+{
+    UINT64 tmp = 0;
+    unsigned char status = VmRead64Status(Field, &tmp);
+    if (status == 0 && Value != NULL)
+        *Value = (UINT16)tmp;
+    return status;
+}
+
+static __forceinline unsigned char VmWrite32Status(UINT64 Field, UINT32 Value)
+{
+    return VmWrite64Status(Field, (UINT64)Value);
+}
+
+static __forceinline unsigned char VmWrite16Status(UINT64 Field, UINT16 Value)
+{
+    return VmWrite64Status(Field, (UINT64)Value);
+}
+
+static __forceinline UINT64 VmRead64(UINT64 Field)
+{
+    UINT64 value = 0;
+    unsigned char status = VmRead64Status(Field, &value);
+    return (status == 0) ? value : 0;
+}
+
+static __forceinline UINT32 VmRead32(UINT64 Field)
+{
+    UINT32 value = 0;
+    unsigned char status = VmRead32Status(Field, &value);
+    return (status == 0) ? value : 0;
+}
+
+static __forceinline UINT16 VmRead16(UINT64 Field)
+{
+    UINT16 value = 0;
+    unsigned char status = VmRead16Status(Field, &value);
+    return (status == 0) ? value : 0;
+}
+
+static __forceinline void VmWrite64(UINT64 Field, UINT64 Value)
+{
+    (void)VmWrite64Status(Field, Value);
+}
+
+static __forceinline void VmWrite32(UINT64 Field, UINT32 Value)
+{
+    (void)VmWrite32Status(Field, Value);
+}
+
+static __forceinline void VmWrite16(UINT64 Field, UINT16 Value)
+{
+    (void)VmWrite16Status(Field, Value);
+}
+
+// VmxAdjustControls applies Intel SDM Vol 3C App. B capability semantics:
+// bits[31:0] are the must-be-1 mask and bits[63:32] are the must-be-0 mask.
 static __forceinline void VmxAdjustControls(UINT32* Ctl, UINT32 Msr)
 {
     UINT64 caps = __readmsr(Msr);
-    *Ctl |=  (UINT32)(caps & 0xFFFFFFFF);           // must-be-1
-    *Ctl &=  (UINT32)((caps >> 32) & 0xFFFFFFFF);   // must-be-0
+    *Ctl |=  (UINT32)(caps & 0xFFFFFFFF);
+    *Ctl &=  (UINT32)((caps >> 32) & 0xFFFFFFFF);
 }
 
-// ---------------------------------------------------------------------------
-//  Vendor detection.
-// ---------------------------------------------------------------------------
+// Vendor detection. The MSVC x64 __cpuid array layout is:
+//   r[0] = EAX, r[1] = EBX, r[2] = ECX, r[3] = EDX.
 static __forceinline HV_VENDOR HvDetectVendor(VOID)
 {
-    int r[4] = { 0 };
-    __cpuid(r, 0);
-    // EBX, EDX, ECX contain the vendor string in that order.
-    UINT32 ebx = (UINT32)r[1];
-    UINT32 edx = (UINT32)r[2];
-    UINT32 ecx = (UINT32)r[3];
-    if (ebx == 0x756E6547 && edx == 0x49656E69 && ecx == 0x6C65746E)
-        return HvVendorIntel;      // "GenuineIntel"
-    if (ebx == 0x68747541 && edx == 0x69746E65 && ecx == 0x444D4163)
-        return HvVendorAmd;        // "AuthenticAMD"
+    int regs[4] = { 0 };
+    __cpuid(regs, 0);
+
+    UINT32 ebx = (UINT32)regs[1];
+    UINT32 ecx = (UINT32)regs[2];
+    UINT32 edx = (UINT32)regs[3];
+
+    // "GenuineIntel": EBX="Genu", ECX="ntel", EDX="ineI"
+    if (ebx == 0x756E6547 &&
+        ecx == 0x6C65746E &&
+        edx == 0x49656E69)
+    {
+        return HvVendorIntel;
+    }
+
+    // "AuthenticAMD": EBX="Auth", ECX="cAMD", EDX="enti"
+    if (ebx == 0x68747541 &&
+        ecx == 0x444D4163 &&
+        edx == 0x69746E65)
+    {
+        return HvVendorAmd;
+    }
+
     return HvVendorUnknown;
 }
 
@@ -704,23 +815,23 @@ static __forceinline HV_VENDOR HvDetectVendor(VOID)
 //  17. Cross-module API declarations
 // ============================================================================
 
-// ept_common.cpp — page-table pool
+// ept_common.cpp - page-table pool
 NTSTATUS HvPtPoolInit(VOID);
 VOID     HvPtPoolDestroy(VOID);
 PVOID    HvPtPoolAlloc(UINT64* OutPhys);
 VOID     HvPtPoolFree(PVOID Page);
 
-// ept_common.cpp — identity ranges
+// ept_common.cpp - identity ranges
 NTSTATUS HvCollectPhysicalRanges(PHV_IDENTITY_RANGE* OutRanges, PULONG OutCount);
 VOID     HvFreePhysicalRanges(HV_IDENTITY_RANGE* Ranges);
 
-// ept_common.cpp — exception injection
-VOID HvInjectGuestPageFault(UINT64 Gpa, BOOLEAN Write, BOOLEAN Execute);
+// ept_common.cpp - exception injection
+NTSTATUS HvInjectGuestPageFault(UINT64 Gpa, BOOLEAN Write, BOOLEAN Execute);
 
 // vmm.cpp
 PPER_CPU_CONTEXT GetCurrentCpu(VOID);
 
-// vmexit.cpp — called from asm stub
+// vmexit.cpp - called from asm stub
 extern "C" void VmxVmExitHandlerC(UINT64* GuestRegs);
 extern "C" void SvmVmExitHandlerC(UINT64* GuestRegs);
 
