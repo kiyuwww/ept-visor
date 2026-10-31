@@ -3,6 +3,7 @@
 //
 //  Contents:
 //    * HvPtPoolInit / HvPtPoolAlloc / HvPtPoolFree / HvPtPoolDestroy
+//    * HvPtPoolVaFromPa  (lock-free, high-IRQL-safe PA -> VA resolver)
 //    * HvCollectPhysicalRanges / HvFreePhysicalRanges
 //    * HvInjectGuestPageFault
 //
@@ -17,28 +18,30 @@
 
 // ----------------------------------------------------------------------------
 //  Global pool. A single pool per hypervisor, shared by all CPUs. The
-//  spinlock protects the array; all mutation is a simple push/pop.
+//  spinlock protects the live array. All mutation is a simple push/pop.
 // ----------------------------------------------------------------------------
 HV_PT_POOL g_PtPool = {};
 
 // ----------------------------------------------------------------------------
-//  Canonical page tracking.
+//  Canonical page-tracking matrix.
 //
-//  Populated once at HvPtPoolInit before Initialized becomes TRUE; cleared
-//  at HvPtPoolDestroy after Initialized becomes FALSE. During steady-state
-//  operation the array is immutable, so HvPtPoolFree may query membership
-//  and the cached physical address outside g_PtPool.Lock without racing.
+//  Populated once inside HvPtPoolInit at PASSIVE_LEVEL, sorted by physical
+//  address, then made immutable for the lifetime of the hypervisor. It is
+//  cleared only by HvPtPoolDestroy after the contract requires all CPUs to
+//  have executed VMXOFF / SVMDISABLE.
 //
-//  This table gives us two independent safety properties:
-//    (a) A foreign / corrupted pointer can never enter the pool, which
-//        would otherwise let an attacker launder arbitrary kernel memory
-//        into the EPT/NPT construction path.
-//    (b) A "returned then returned again" double-free can be detected
-//        inside the lock by scanning the live Pages[] array.
+//  The matrix provides three independent safety properties:
+//    (a) O(log n) VA resolution from PA without ever calling
+//        MmGetVirtualForPhysical from a VM-exit (which is illegal at
+//        DISPATCH_LEVEL and above).
+//    (b) Foreign pointer / pool-pollution defence: a caller that supplies
+//        a pointer that never came out of HvPtPoolAlloc is rejected here.
+//    (c) Double-free detection together with a scan of the live Pages[]
+//        array under the lock.
 // ----------------------------------------------------------------------------
-static PVOID   s_PoolCanon[HV_PT_POOL_MAX_PAGES];
-static UINT64  s_PoolCanonPhys[HV_PT_POOL_MAX_PAGES];
-static ULONG   s_PoolCanonCount = 0;
+static PVOID  s_PoolCanon[HV_PT_POOL_MAX_PAGES];
+static UINT64 s_PoolCanonPhys[HV_PT_POOL_MAX_PAGES];
+static ULONG  s_PoolCanonCount = 0;
 
 // ----------------------------------------------------------------------------
 //  Outstanding accounting. Incremented on every successful pop, decremented
@@ -79,7 +82,12 @@ static UINT32 HvGetMaxPhyAddrBits(VOID)
 //  handler, so pre-populating here avoids any IRQL-incompatible allocation
 //  later on the hot path.
 //
-//  On partial failure we free whatever we already allocated and return
+//  After every page is allocated we sort the canonical matrix by physical
+//  address so that HvPtPoolVaFromPa can binary-search it lock-free from a
+//  VM-exit. The sort is insertion-based because HV_PT_POOL_MAX_PAGES is a
+//  small compile-time constant and init time is unconstrained.
+//
+//  On partial failure we roll back every page already allocated and return
 //  STATUS_INSUFFICIENT_RESOURCES. The caller must treat this as fatal — a
 //  hypervisor without a PT pool cannot split large pages and therefore
 //  cannot protect memory.
@@ -88,8 +96,8 @@ NTSTATUS HvPtPoolInit(VOID)
 {
     if (g_PtPool.Initialized) return STATUS_ALREADY_REGISTERED;
 
-    RtlZeroMemory(g_PtPool.Pages, sizeof(g_PtPool.Pages));
-    RtlZeroMemory(g_PtPool.Phys,  sizeof(g_PtPool.Phys));
+    RtlZeroMemory(g_PtPool.Pages,  sizeof(g_PtPool.Pages));
+    RtlZeroMemory(g_PtPool.Phys,   sizeof(g_PtPool.Phys));
     RtlZeroMemory(s_PoolCanon,     sizeof(s_PoolCanon));
     RtlZeroMemory(s_PoolCanonPhys, sizeof(s_PoolCanonPhys));
     g_PtPool.Top         = 0;
@@ -97,6 +105,7 @@ NTSTATUS HvPtPoolInit(VOID)
     s_PoolCanonCount     = 0;
     s_PoolOutstanding    = 0;
 
+    ULONG allocated = 0;
     for (ULONG i = 0; i < HV_PT_POOL_MAX_PAGES; i++) {
         PVOID p = MmAllocateContiguousMemorySpecifyCacheNode(
             PAGE_SIZE,
@@ -106,20 +115,7 @@ NTSTATUS HvPtPoolInit(VOID)
             MmCached,
             MM_ANY_NODE_OK);
 
-        if (!p) {
-            // Roll back — free everything we have so far.
-            for (ULONG j = 0; j < i; j++) {
-                if (g_PtPool.Pages[j]) {
-                    MmFreeContiguousMemory(g_PtPool.Pages[j]);
-                    g_PtPool.Pages[j]     = NULL;
-                    g_PtPool.Phys[j]      = 0;
-                    s_PoolCanon[j]        = NULL;
-                    s_PoolCanonPhys[j]    = 0;
-                }
-            }
-            s_PoolCanonCount = 0;
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
+        if (!p) break;
 
         RtlZeroMemory(p, PAGE_SIZE);
         UINT64 phys = MmGetPhysicalAddress(p).QuadPart & ~0xFFFULL;
@@ -127,10 +123,40 @@ NTSTATUS HvPtPoolInit(VOID)
         g_PtPool.Phys[i]      = phys;
         s_PoolCanon[i]        = p;
         s_PoolCanonPhys[i]    = phys;
+        allocated++;
     }
 
-    s_PoolCanonCount     = HV_PT_POOL_MAX_PAGES;
-    g_PtPool.Top         = HV_PT_POOL_MAX_PAGES;
+    if (allocated < HV_PT_POOL_MAX_PAGES) {
+        // Roll back every page already claimed so no resources leak when
+        // the caller observes the failure and aborts driver load.
+        for (ULONG j = 0; j < allocated; j++) {
+            MmFreeContiguousMemory(g_PtPool.Pages[j]);
+        }
+        RtlZeroMemory(g_PtPool.Pages,  sizeof(g_PtPool.Pages));
+        RtlZeroMemory(g_PtPool.Phys,   sizeof(g_PtPool.Phys));
+        RtlZeroMemory(s_PoolCanon,     sizeof(s_PoolCanon));
+        RtlZeroMemory(s_PoolCanonPhys, sizeof(s_PoolCanonPhys));
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    // Sort canonical matrix by PA so HvPtPoolVaFromPa can binary-search it.
+    // This invariant must hold before s_PoolCanonCount is published, since
+    // once the count is published the array is queried lock-free.
+    for (ULONG i = 1; i < allocated; i++) {
+        UINT64 kp = s_PoolCanonPhys[i];
+        PVOID  kv = s_PoolCanon[i];
+        ULONG  j  = i;
+        while (j > 0 && s_PoolCanonPhys[j - 1] > kp) {
+            s_PoolCanonPhys[j] = s_PoolCanonPhys[j - 1];
+            s_PoolCanon[j]     = s_PoolCanon[j - 1];
+            j--;
+        }
+        s_PoolCanonPhys[j] = kp;
+        s_PoolCanon[j]     = kv;
+    }
+
+    s_PoolCanonCount     = allocated;
+    g_PtPool.Top         = allocated;
     g_PtPool.Initialized = TRUE;
 
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
@@ -140,13 +166,46 @@ NTSTATUS HvPtPoolInit(VOID)
 }
 
 // ----------------------------------------------------------------------------
+//  HvPtPoolVaFromPa — resolve a PA to its canonical VA.
+//
+//  This function is intentionally callable from any IRQL (including
+//  DISPATCH_LEVEL and above) from VM-exit handlers: it performs a single
+//  non-blocking binary search over an immutable, PA-sorted flat array.
+//  It never touches the page-table pool lock, never calls the memory
+//  manager, and never triggers memory-synchronisation faults.
+//
+//  Returns NULL if Pa does not belong to any page owned by this pool,
+//  which is the desired behaviour for a corrupted / spoofed PA.
+// ----------------------------------------------------------------------------
+PVOID HvPtPoolVaFromPa(UINT64 Pa)
+{
+    ULONG count = s_PoolCanonCount;
+    if (count == 0) return NULL;
+
+    UINT64 target = Pa & ~0xFFFULL;
+    ULONG  lo = 0, hi = count;
+    while (lo < hi) {
+        ULONG  mid   = lo + ((hi - lo) >> 1);
+        UINT64 midPa = s_PoolCanonPhys[mid];
+        if (midPa < target) {
+            lo = mid + 1;
+        } else if (midPa > target) {
+            hi = mid;
+        } else {
+            return s_PoolCanon[mid];
+        }
+    }
+    return NULL;
+}
+
+// ----------------------------------------------------------------------------
 //  HvPtPoolAlloc — pop a page. Safe to call from any IRQL.
 //
 //  The Initialized flag is verified strictly under the acquired lock so
 //  teardown cannot race past the check and mutate a half-torn-down array.
-//  The page is explicitly zeroed before it is handed to the caller so that
-//  no stale EPT/NPT entry from a previous split (or a prior owner) can leak
-//  through into the guest's address translation.
+//  The page is explicitly zeroed via RtlZeroMemory before it is handed
+//  back to the caller so that no stale EPT/NPT entry from a previous split
+//  (or a prior owner) can leak through into the guest's address translation.
 // ----------------------------------------------------------------------------
 PVOID HvPtPoolAlloc(UINT64* OutPhys)
 {
@@ -182,12 +241,13 @@ PVOID HvPtPoolAlloc(UINT64* OutPhys)
 //  a page that is reachable from a live PDE/PTE.
 //
 //  Fix requirements enforced here:
-//    * Membership and physical-address resolution are performed BEFORE the
-//      lock so no prolonged tracking runs under the global spinlock.
+//    * Membership resolution is performed against the immutable canonical
+//      table without touching the lock.
 //    * A pointer not owned by this pool is rejected without ever entering
-//      Pages[] (foreign-pointer / pool-pollution defense).
-//    * A pointer already present in Pages[] is rejected (double-free guard).
-//    * The only path that frees to the allocator never holds the lock.
+//      Pages[] (foreign-pointer / pool-pollution defence).
+//    * A pointer already resident in Pages[] is rejected (double-free guard).
+//    * The only path that frees to the allocator never holds the lock —
+//      the free is deferred and executed after SpinRelease.
 // ----------------------------------------------------------------------------
 VOID HvPtPoolFree(PVOID Page)
 {
@@ -241,7 +301,8 @@ VOID HvPtPoolFree(PVOID Page)
         InterlockedDecrement(&s_PoolOutstanding);
     } else {
         // Structural invariant broken — pool full but page is ours and
-        // absent from the pool. Defer the free outside the spinlock.
+        // absent from the pool. Defer the free outside the spinlock so we
+        // never invoke the memory manager under the pool lock.
         freeToSystem = TRUE;
         InterlockedDecrement(&s_PoolOutstanding);
     }
@@ -306,8 +367,8 @@ VOID HvPtPoolDestroy(VOID)
         MmFreeContiguousMemory(localPages[i]);
     }
 
-    // The canonical table is now stale by definition; wipe it so a later
-    // HvPtPoolInit sees a clean slate.
+    // The canonical matrix is now stale by contract (all CPUs stopped).
+    // Wipe it so a later HvPtPoolInit starts from a clean slate.
     RtlZeroMemory(s_PoolCanon,     sizeof(s_PoolCanon));
     RtlZeroMemory(s_PoolCanonPhys, sizeof(s_PoolCanonPhys));
     s_PoolCanonCount = 0;
@@ -329,11 +390,11 @@ VOID HvPtPoolDestroy(VOID)
 //
 //  MmGetPhysicalMemoryRanges() returns a NULL-terminated array of
 //  PHYSICAL_MEMORY_RANGE. The current documentation claims the array is
-//  sorted by base address, but nothing in the API contract guarantees
-//  that — so we sort defensively before coalescing. Duplicated or
-//  overlapping descriptors that slipped through would cause the EPT/NPT
-//  builder to double-install the same identity mapping and waste PDE/PTE
-//  leaves or, worse, reopen a mapping after a split race.
+//  sorted by base address, but nothing in the API contract guarantees it,
+//  so we sort defensively before coalescing. Duplicate or overlapping
+//  descriptors that slipped through would cause the EPT/NPT builder to
+//  double-install the same identity mapping and waste PDE/PTE leaves or,
+//  worse, reopen a mapping after a split race.
 //
 //  All arithmetic on (base + size) is checked for 64-bit wrap. Ranges
 //  whose base exceeds the CPU's MAXPHYADDR are dropped; ranges that
@@ -349,6 +410,10 @@ VOID HvPtPoolDestroy(VOID)
 // ----------------------------------------------------------------------------
 NTSTATUS HvCollectPhysicalRanges(PHV_IDENTITY_RANGE* OutRanges, PULONG OutCount)
 {
+    // Reasonable cap on the raw descriptor count so a corrupt boot table
+    // with a missing terminator cannot spin the enumeration to MAXULONG.
+    const ULONG kMaxRawDescriptors = 0x10000;
+
     if (!OutRanges || !OutCount) return STATUS_INVALID_PARAMETER;
     *OutRanges = NULL;
     *OutCount  = 0;
@@ -356,16 +421,16 @@ NTSTATUS HvCollectPhysicalRanges(PHV_IDENTITY_RANGE* OutRanges, PULONG OutCount)
     PPHYSICAL_MEMORY_RANGE ranges = MmGetPhysicalMemoryRanges();
     if (!ranges) return STATUS_INSUFFICIENT_RESOURCES;
 
-    // First pass: count non-empty entries. Cap at MAXULONG to guard against
-    // a runaway loop if the terminator is missing.
+    // First pass: count non-empty entries. Bounded so a runaway loop is
+    // impossible even if the terminator is missing.
     ULONG rawCount = 0;
     for (;;) {
-        if (ranges[rawCount].NumberOfBytes.QuadPart == 0) break;
-        rawCount++;
-        if (rawCount == MAXULONG) {
+        if (rawCount >= kMaxRawDescriptors) {
             ExFreePool(ranges);
             return STATUS_INTEGER_OVERFLOW;
         }
+        if (ranges[rawCount].NumberOfBytes.QuadPart == 0) break;
+        rawCount++;
     }
     if (rawCount == 0) {
         ExFreePool(ranges);
@@ -396,7 +461,7 @@ NTSTATUS HvCollectPhysicalRanges(PHV_IDENTITY_RANGE* OutRanges, PULONG OutCount)
                           ? MAXULONG64
                           : (((UINT64)1 << maxPhyAddrBits));
 
-    // Second pass: normalize and copy.
+    // Second pass: normalize and copy with checked arithmetic everywhere.
     ULONG outIdx = 0;
     for (ULONG i = 0; i < rawCount; i++) {
         UINT64 base = ranges[i].BaseAddress.QuadPart;
@@ -407,13 +472,13 @@ NTSTATUS HvCollectPhysicalRanges(PHV_IDENTITY_RANGE* OutRanges, PULONG OutCount)
         UINT64 rawEnd = base + size;
         if (rawEnd < base) continue;
 
-        // MAXPHYADDR gate.
+        // MAXPHYADDR gate (drop, then clamp straddling ranges).
         if ((base & ~maxPhyMask) != 0) continue;
         if (base >= maxPhyLimit) continue;
         if (size > (maxPhyLimit - base)) size = maxPhyLimit - base;
 
         // 4KB alignment normalization (defensive; API guarantees this).
-        if (base & 0xFFF) {
+        if (base & 0xFFFULL) {
             UINT64 delta = base & 0xFFFULL;
             base = (base + 0xFFFULL) & ~0xFFFULL;
             if (size >= delta) size -= delta;
@@ -447,7 +512,9 @@ NTSTATUS HvCollectPhysicalRanges(PHV_IDENTITY_RANGE* OutRanges, PULONG OutCount)
         copy[j] = tmp;
     }
 
-    // Coalesce adjacent or overlapping descriptors in-place.
+    // Coalesce adjacent or overlapping descriptors in-place, honouring
+    // 64-bit saturation on the running end so subsequent ranges cannot be
+    // silently re-opened after a wrap.
     ULONG coalesced = 0;
     for (ULONG i = 0; i < outIdx; i++) {
         if (coalesced == 0) {
@@ -492,7 +559,7 @@ VOID HvFreePhysicalRanges(HV_IDENTITY_RANGE* Ranges)
 //  NptSplit2MBTwoPhase. We must NOT allocate in the exit handler, so the
 //  only safe action is to deny the access with the correct architectural
 //  exception. The guest OS will deliver it to the faulting process, which
-//  is exactly what a hardware page fault does — no defensive degradation.
+//  is exactly what a hardware page fault does.
 //
 //  The fault address supplied to the guest architectural state must be the
 //  LINEAR (virtual) address that triggered the fault, never the GPA that
@@ -512,19 +579,32 @@ VOID HvFreePhysicalRanges(HV_IDENTITY_RANGE* Ranges)
 //  the caller supplies that impossible combination (vendor-exit decoding
 //  bug), we sanitize by dropping the instruction-fetch bit so the guest
 //  never receives an architecturally impossible error code.
+//
+//  Returns STATUS_SUCCESS if the exception was dispatched, or a failure
+//  status if the vendor backend is not yet online. The caller is
+//  responsible for translating a failure into a VM-entry failure of its
+//  own; this function never silently corrupts guest architectural state.
 // ----------------------------------------------------------------------------
-VOID HvInjectGuestPageFault(UINT64  GuestLinearAddress,
-                            BOOLEAN Present,
-                            BOOLEAN Write,
-                            BOOLEAN Execute,
-                            BOOLEAN UserMode)
+NTSTATUS HvInjectGuestPageFault(UINT64  GuestLinearAddress,
+                                BOOLEAN Present,
+                                BOOLEAN Write,
+                                BOOLEAN Execute,
+                                BOOLEAN UserMode)
 {
     if (!g_HvOps || !g_HvOps->InjectException) {
-        // Vendor backend not initialized — this must never happen. Bugcheck
-        // rather than silently corrupt guest architectural state.
-        KeBugCheckEx(0xE0000002, GuestLinearAddress, Present, Write, Execute);
+        // Vendor backend not initialized — this must never happen once
+        // VMRESUME/VMRUN is armed. Surface a clear failure boundary
+        // instead of corrupting guest architectural state.
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[HV] HvInjectGuestPageFault: backend not initialized "
+            "(LA=%p P=%u W=%u X=%u U=%u)\n",
+            (PVOID)GuestLinearAddress, Present, Write, Execute, UserMode);
+        return STATUS_INVALID_DEVICE_STATE;
     }
 
+    // Rigid validation: #PF can never be both a data write and an
+    // instruction fetch. Drop the X bit so the guest never receives an
+    // architecturally impossible error code.
     if (Write && Execute) {
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
             "[HV] HvInjectGuestPageFault: sanitizing impossible W&&X "
@@ -538,5 +618,9 @@ VOID HvInjectGuestPageFault(UINT64  GuestLinearAddress,
     if (UserMode) errorCode |= 0x04;   // U/S
     if (Execute)  errorCode |= 0x10;   // I/D
 
+    // Route through the vendor backend; the backend is responsible for
+    // writing GuestLinearAddress into VMCS_GUEST_CR2 (Intel) or the AMD
+    // equivalent CR2 save slot prior to VMRESUME/VMRUN.
     g_HvOps->InjectException(14 /* #PF */, errorCode, GuestLinearAddress);
+    return STATUS_SUCCESS;
 }
