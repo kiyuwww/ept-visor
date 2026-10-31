@@ -55,8 +55,8 @@ static INTEL_EPT_CONTEXT g_Ept = {};
 
 // ----------------------------------------------------------------------------
 //  EptAllocatePage — 4 KB sheet from the pre-allocated pool.
-//  NEVER call MmAllocateContiguousMemory here: this runs from
-//  VmxSplitAndGetPte, which is reached from the VM-exit handler.
+//  Never call MmAllocateContiguousMemory here: this is reached from
+//  VmxSplitAndGetPte, which in turn is called from the VM-exit handler.
 // ----------------------------------------------------------------------------
 static PVOID EptAllocatePage(VOID)
 {
@@ -158,6 +158,8 @@ static NTSTATUS EptInitialize(const HV_IDENTITY_RANGE* Ranges, ULONG Count)
 
 // ----------------------------------------------------------------------------
 //  EptInveptSingle — single-context invalidation for the current EPTP.
+//  Only flushes the LOCAL processor's translation cache. Callers that
+//  change effective permissions must follow up with EptInveptBroadcast().
 //  Descriptor must be 16-byte aligned (SDM Vol 3C 25.6.11).
 // ----------------------------------------------------------------------------
 static VOID EptInveptSingle(VOID)
@@ -165,6 +167,51 @@ static VOID EptInveptSingle(VOID)
     __declspec(align(16)) struct { UINT64 Eptp; UINT64 Reserved; } desc =
         { g_Ept.Eptp, 0 };
     _invept(1, &desc);   // 1 = single-context
+}
+
+// ----------------------------------------------------------------------------
+//  EptInveptLocalAll — all-context invalidation on the current processor.
+//  Since this hypervisor uses a single shared EPTP, all-context is
+//  equivalent to single-context but cheaper to encode for a broadcast.
+// ----------------------------------------------------------------------------
+static VOID EptInveptLocalAll(VOID)
+{
+    __declspec(align(16)) struct { UINT64 A; UINT64 B; } desc = { 0, 0 };
+    _invept(2, &desc);   // 2 = all-context
+}
+
+// ----------------------------------------------------------------------------
+//  Cross-core TLB shootdown.
+//
+//  _invept only invalidates the processor executing it. Any EPT
+//  permission change is only architecturally visible to a remote CPU
+//  after that CPU has itself run INVEPT. We therefore broadcast via
+//  KeGenericCallDpc: each logical CPU enters a DPC, executes a local
+//  all-context INVEPT, and synchronizes before KeSignalCallDpcDone so
+//  the caller only returns once every core has flushed.
+//
+//  Called from PASSIVE/DISPATCH_LEVEL contexts (EPT mutation helpers or
+//  VMCALL teardown). The DPC routine deliberately does not touch any
+//  hypervisor locks: the caller releases g_Ept.Lock before broadcasting
+//  so the DPC cannot deadlock against a mutator running on another CPU.
+// ----------------------------------------------------------------------------
+static VOID EptInveptBroadcastDpc(
+    PKDPC Dpc, PVOID DeferredContext, PVOID SystemArgument1, PVOID SystemArgument2)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(DeferredContext);
+
+    EptInveptLocalAll();
+
+    // Wait for every other CPU to reach this point, then signal the
+    // launcher that this DPC is complete.
+    KeSignalCallDpcSynchronize(SystemArgument2);
+    KeSignalCallDpcDone(SystemArgument1);
+}
+
+static VOID EptInveptBroadcast(VOID)
+{
+    KeGenericCallDpc(EptInveptBroadcastDpc, NULL);
 }
 
 // ----------------------------------------------------------------------------
@@ -218,18 +265,20 @@ static EPT_LOOKUP_RESULT EptLookupLocked(
 }
 
 // ----------------------------------------------------------------------------
-//  VmxSplitAndGetPte — deadlock-safe two-phase split.
+//  VmxSplitAndGetPteInternal — one attempt of the deadlock-safe split.
 //
 //  Phase 1 (locked)   : probe, decide if a split is needed.
 //  Phase 2 (unlocked) : pop a 4 KB PT from the pre-allocated pool.
 //  Phase 3 (locked)   : re-verify the PDE, commit, INVEPT.
 //
-//  HvPtPoolAlloc never blocks — it is a short spinlock-protected pop.
-//  If the pool is exhausted, we return STATUS_INSUFFICIENT_RESOURCES;
-//  the VM-exit handler must then inject #PF (never call a blocking
-//  allocator).
+//  HvPtPoolAlloc never blocks. If the pool is exhausted this returns
+//  STATUS_INSUFFICIENT_RESOURCES; the VM-exit handler must then inject
+//  #PF (never call a blocking allocator).
+//
+//  Returns STATUS_RETRY to indicate a benign race with another CPU that
+//  must be retried by the caller.
 // ----------------------------------------------------------------------------
-static NTSTATUS VmxSplitAndGetPte(UINT64 Gpa, PEPT_ENTRY* OutPte)
+static NTSTATUS VmxSplitAndGetPteInternal(UINT64 Gpa, PEPT_ENTRY* OutPte)
 {
     EPT_SPLIT_PLAN    plan   = {};
     PEPT_ENTRY        pte    = NULL;
@@ -252,8 +301,8 @@ static NTSTATUS VmxSplitAndGetPte(UINT64 Gpa, PEPT_ENTRY* OutPte)
 
     // Replicate the original 2 MB mapping as 512 4 KB PTEs.
     // MemType = 6 (Write-Back) is mandatory for RAM; zero would make
-    // the CPU treat the page as uncached and trigger EPT misconfig on
-    // some microarchitectures.
+    // the CPU treat the page as uncached and trigger an EPT misconfig
+    // on some microarchitectures.
     for (UINT32 i = 0; i < 512; i++) {
         newPt[i].Value = 0;
         newPt[i].Fields.Read      = (plan.OriginalPerm & EPT_PERM_READ)    ? 1 : 0;
@@ -297,6 +346,8 @@ static NTSTATUS VmxSplitAndGetPte(UINT64 Gpa, PEPT_ENTRY* OutPte)
 
         if (OutPte) *OutPte = existingPte;
         HvPtPoolFree(newPt);
+        // The split mapping is functionally identical to the original
+        // 2 MB entry: this CPU only needs a local flush to see it.
         EptInveptSingle();
         SpinRelease(&g_Ept.Lock);
         return STATUS_SUCCESS;
@@ -326,7 +377,26 @@ static NTSTATUS VmxSplitAndGetPte(UINT64 Gpa, PEPT_ENTRY* OutPte)
 }
 
 // ----------------------------------------------------------------------------
+//  VmxSplitAndGetPte — bounded retry wrapper.
+//
+//  Multithreaded splits may race and produce STATUS_RETRY. Absorb that
+//  entirely inside the allocator so callers always receive a definitive
+//  STATUS_SUCCESS or a hard failure.
+// ----------------------------------------------------------------------------
+static NTSTATUS VmxSplitAndGetPte(UINT64 Gpa, PEPT_ENTRY* OutPte)
+{
+    for (ULONG attempt = 0; attempt < 5; attempt++) {
+        NTSTATUS st = VmxSplitAndGetPteInternal(Gpa, OutPte);
+        if (st != STATUS_RETRY) return st;
+    }
+    return STATUS_UNSUCCESSFUL;
+}
+
+// ----------------------------------------------------------------------------
 //  VmxProtectRange — set permissions on a 4 KB-aligned GPA range.
+//  Modifications are applied per-page under the EPT lock with a local
+//  INVEPT; a single cross-core broadcast flushes remote TLBs once the
+//  whole range has been rewritten.
 // ----------------------------------------------------------------------------
 static NTSTATUS VmxProtectRange(UINT64 Gpa, UINT64 Size, UINT64 Perms)
 {
@@ -347,12 +417,17 @@ static NTSTATUS VmxProtectRange(UINT64 Gpa, UINT64 Size, UINT64 Perms)
         EptInveptSingle();
         SpinRelease(&g_Ept.Lock);
     }
+
+    // Remote CPUs still hold the pre-change translations in their TLBs.
+    // Broadcast an all-context INVEPT across every logical processor.
+    EptInveptBroadcast();
     return STATUS_SUCCESS;
 }
 
 // ----------------------------------------------------------------------------
 //  VmxSaveAndGrant — atomically OR permission bits into an EPT entry and
 //  return the previous value so the caller can restore it on the next exit.
+//  Broadcasts after the mutation to flush remote TLBs.
 // ----------------------------------------------------------------------------
 static NTSTATUS VmxSaveAndGrant(UINT64 Gpa, UINT64 Perms, UINT64* OutOriginal)
 {
@@ -381,12 +456,16 @@ static NTSTATUS VmxSaveAndGrant(UINT64 Gpa, UINT64 Perms, UINT64* OutOriginal)
 
     EptInveptSingle();
     SpinRelease(&g_Ept.Lock);
+
+    // Permission change must be visible to every core before we return.
+    EptInveptBroadcast();
     return STATUS_SUCCESS;
 }
 
 // ----------------------------------------------------------------------------
 //  VmxRestoreEntry — write back a previously saved EPT entry value.
-//  Called from the MTF handler.
+//  Called from the MTF handler; broadcast is required so that any CPU
+//  which observed the granted permission sees the original value.
 // ----------------------------------------------------------------------------
 static NTSTATUS VmxRestoreEntry(UINT64 Gpa, UINT64 OriginalValue)
 {
@@ -404,6 +483,8 @@ static NTSTATUS VmxRestoreEntry(UINT64 Gpa, UINT64 OriginalValue)
     live->Value = OriginalValue;
     EptInveptSingle();
     SpinRelease(&g_Ept.Lock);
+
+    EptInveptBroadcast();
     return STATUS_SUCCESS;
 }
 
@@ -510,7 +591,7 @@ static NTSTATUS VmxInitializeVmcs(PPER_CPU_CONTEXT Cpu)
     // ---- 4. Primary processor-based controls ----
     // Only EPT and MSR bitmap; no CR3/DR/HLT/MWAIT trapping because we
     // do not emulate them — trapping them without emulation causes an
-    // infinite VM-exit loop (issue #4 of the audit).
+    // infinite VM-exit loop.
     UINT32 procCtl = CPU_BASED_USE_MSR_BITMAPS
                    | CPU_BASED_ACTIVATE_SECONDARY;
     VmxAdjustControls(&procCtl, MSR_IA32_VMX_PROCBASED_CTLS);
@@ -524,12 +605,21 @@ static NTSTATUS VmxInitializeVmcs(PPER_CPU_CONTEXT Cpu)
     VmWrite32(VMCS_PROC_BASED_CTLS2, procCtl2);
 
     // ---- 6. Exit controls ----
-    UINT32 exitCtl = VM_EXIT_HOST_ADDR_SPACE_SIZE | VM_EXIT_ACK_INTR_ON_EXIT;
+    // PAT/EFER must round-trip through their VMCS fields on both
+    // transitions. Otherwise guest changes to PAT (WC/PAT semantics) or
+    // EFER (SCE/NXE/LMSLE) silently leak into the host on VM exit and
+    // corrupt host paging or SYSCALL state.
+    UINT32 exitCtl = VM_EXIT_HOST_ADDR_SPACE_SIZE
+                   | VM_EXIT_ACK_INTR_ON_EXIT
+                   | VM_EXIT_LOAD_IA32_PAT
+                   | VM_EXIT_LOAD_IA32_EFER;
     VmxAdjustControls(&exitCtl, MSR_IA32_VMX_EXIT_CTLS);
     VmWrite32(VMCS_EXIT_CTLS, exitCtl);
 
     // ---- 7. Entry controls ----
-    UINT32 entryCtl = VM_ENTRY_IA32E_MODE;
+    UINT32 entryCtl = VM_ENTRY_IA32E_MODE
+                    | VM_ENTRY_LOAD_IA32_PAT
+                    | VM_ENTRY_LOAD_IA32_EFER;
     VmxAdjustControls(&entryCtl, MSR_IA32_VMX_ENTRY_CTLS);
     VmWrite32(VMCS_ENTRY_CTLS, entryCtl);
 
@@ -556,13 +646,23 @@ static NTSTATUS VmxInitializeVmcs(PPER_CPU_CONTEXT Cpu)
     VmWrite64(VMCS_GUEST_CR4, cr4);
 
     VmWrite64(VMCS_GUEST_CR3, __readcr3());
-    VmWrite64(VMCS_GUEST_DR7, 0x400);
 
-    // ---- 11. GUEST_IA32_EFER — synchronize with live host EFER ----
+    // GUEST_DR7: mirror the live debug-control register. Some fuzzers
+    // and debuggers run with non-default DR7 settings; syncing avoids
+    // any post-launch DR-access inconsistency.
+    VmWrite64(VMCS_GUEST_DR7, __readdr(7));
+
+    // ---- 11. GUEST_IA32_EFER / PAT — synchronize with live host MSRs ----
     // LMA and LME must be consistent with CR0.PG and CR4.PAE; since we
     // are mirroring the current OS state, the live MSR is correct.
+    // Both fields are only touched when the corresponding load control
+    // is actually supported on this CPU.
     UINT64 efer = __readmsr(MSR_IA32_EFER);
-    VmWrite64(VMCS_GUEST_IA32_EFER, efer);
+    UINT64 pat  = __readmsr(MSR_IA32_PAT);
+    if (entryCtl & VM_ENTRY_LOAD_IA32_EFER)
+        VmWrite64(VMCS_GUEST_IA32_EFER, efer);
+    if (entryCtl & VM_ENTRY_LOAD_IA32_PAT)
+        VmWrite64(VMCS_GUEST_IA32_PAT, pat);
 
     // ---- 12. Guest segment state ----
     // In long mode CS/SS/DS/ES bases are 0 and limits are 0xFFFFFFFF.
@@ -624,14 +724,32 @@ static NTSTATUS VmxInitializeVmcs(PPER_CPU_CONTEXT Cpu)
     VmWrite64(VMCS_GUEST_IDTR_BASE, idtr.Base);
     VmWrite32(VMCS_GUEST_IDTR_LIMIT, idtr.Limit);
 
-    // RFLAGS: keep the live value; RIP/RSP are set at VMLAUNCH time by
-    // the assembly VmxLaunch helper.
-    VmWrite64(VMCS_GUEST_RFLAGS, __readeflags());
+    // SYSENTER state: SYSENTER_CS must be copied from the live MSR to
+    // satisfy VMLAUNCH consistency checks. SYSENTER_ESP / _EIP must be
+    // written explicitly (zero) even though a 64-bit guest will use
+    // SYSCALL — VMLAUNCH validates these as required writable fields.
+    VmWrite32(VMCS_GUEST_SYSENTER_CS, (UINT32)__readmsr(MSR_IA32_SYSENTER_CS));
+    VmWrite64(VMCS_GUEST_SYSENTER_ESP, 0);
+    VmWrite64(VMCS_GUEST_SYSENTER_EIP, 0);
+
+    // RFLAGS: preserve the live flag state but mask out reserved bits.
+    // Bit 1 is reserved and must be forced to 1 per Intel architecture.
+    // Bits 3, 5, 15, 22..63 are reserved and must be zero.
+    UINT64 rflags = __readeflags() & 0x3F7FD5ULL;
+    rflags |= 0x2ULL;
+    VmWrite64(VMCS_GUEST_RFLAGS, rflags);
 
     // ---- 13. Host state ----
     VmWrite64(VMCS_HOST_CR0, __readcr0());
     VmWrite64(VMCS_HOST_CR3, __readcr3());
     VmWrite64(VMCS_HOST_CR4, __readcr4() | X86_CR4_VMXE);
+
+    // PAT / EFER host fields, only when the corresponding exit load
+    // controls were successfully negotiated by VmxAdjustControls.
+    if (exitCtl & VM_EXIT_LOAD_IA32_PAT)
+        VmWrite64(VMCS_HOST_IA32_PAT, pat);
+    if (exitCtl & VM_EXIT_LOAD_IA32_EFER)
+        VmWrite64(VMCS_HOST_IA32_EFER, efer);
 
     VmWrite16(VMCS_HOST_CS_SEL, __readcs());
     VmWrite16(VMCS_HOST_SS_SEL, __readss());
@@ -646,6 +764,13 @@ static NTSTATUS VmxInitializeVmcs(PPER_CPU_CONTEXT Cpu)
     VmWrite64(VMCS_HOST_TR_BASE, trBase);
     VmWrite64(VMCS_HOST_GDTR_BASE, gdtr.Base);
     VmWrite64(VMCS_HOST_IDTR_BASE, idtr.Base);
+
+    // Host SYSENTER state must be initialized for symmetry even though
+    // the host runs in long mode; leaving stale zeroes can trip
+    // VM-entry checks on some microarchitectures.
+    VmWrite32(VMCS_HOST_SYSENTER_CS, (UINT32)__readmsr(MSR_IA32_SYSENTER_CS));
+    VmWrite64(VMCS_HOST_SYSENTER_ESP, __readmsr(MSR_IA32_SYSENTER_ESP));
+    VmWrite64(VMCS_HOST_SYSENTER_EIP, __readmsr(MSR_IA32_SYSENTER_EIP));
 
     VmWrite64(VMCS_HOST_RSP, Cpu->HostStackTop);
     VmWrite64(VMCS_HOST_RIP, (UINT64)VmxVmExitEntry);
@@ -677,7 +802,11 @@ static NTSTATUS VmxSetupCurrentCpu(PVOID /*Context*/)
         return STATUS_UNSUCCESSFUL;
     }
 
-    cpu->Launched = TRUE;
+    // cpu->Launched is deliberately NOT set here. A CPU that has
+    // completed VMXON + VMCS setup is not yet running guest code: the
+    // flag is used to gate VMCALL-based teardown, and VMCALL from root
+    // mode would fault. The flag is only raised after VMLAUNCH succeeds
+    // (see VmxLaunchCurrentCpu).
     return STATUS_SUCCESS;
 }
 
@@ -688,11 +817,24 @@ static NTSTATUS VmxLaunchCurrentCpu(VOID)
 
     UINT8 err = VmxLaunch();
     if (err != 0) {
+        UINT32 vmcsErr = VmRead32(VMCS_VM_INSTRUCTION_ERROR);
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-            "[HV] VMLAUNCH failed: err=0x%X vmcs_err=0x%llX\n",
-            err, VmRead32(VMCS_VM_INSTRUCTION_ERROR));
+            "[HV] VMLAUNCH failed on CPU %u: err=0x%X vmcs_err=0x%X\n",
+            cpu->CpuIndex, err, vmcsErr);
+
+        // Bare-metal recovery on this core: discard the VMCS, leave VMX
+        // operation and clear CR4.VMXE so this processor can continue
+        // executing normally. Without this path, a partial multi-CPU
+        // launch leaves the failed CPU in an undefined root state.
+        __vmx_vmclear(&cpu->VmcsPa);
+        __vmx_vmxoff();
+        __writecr4(__readcr4() & ~X86_CR4_VMXE);
         return STATUS_UNSUCCESSFUL;
     }
+
+    // Transition to guest context succeeded. Mark the CPU as live so
+    // teardown paths will VMCALL it back to root.
+    cpu->Launched = TRUE;
     return STATUS_SUCCESS;
 }
 
@@ -754,8 +896,11 @@ static VOID VmxTeardown(VOID)
 {
     InterlockedExchange(&g_ShuttingDown, 1);
 
-    ULONG count = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-    if (count == 0) count = KeQueryActiveProcessorCount(NULL);
+    // Iterate strictly over the static boot-time CPU count. Runtime
+    // hot-plug processors are intentionally NOT touched here: they were
+    // never brought up under this hypervisor and their per-CPU context
+    // does not exist in g_PerCpu.
+    ULONG count = g_CpuCount;
 
     for (ULONG i = 0; i < count; i++) {
         PROCESSOR_NUMBER pn;
@@ -771,7 +916,7 @@ static VOID VmxTeardown(VOID)
     }
 
     // Free per-CPU resources. Use the exact matching deallocator for each
-    // allocation API (issue #10 of the audit).
+    // allocation API.
     if (g_PerCpu) {
         for (ULONG i = 0; i < g_CpuCount; i++) {
             if (g_PerCpu[i].MsrBitmapVa) {
@@ -895,21 +1040,46 @@ static VOID VmxDisarmSingleStep(PPER_CPU_CONTEXT Cpu)
 
 static VOID VmxInjectException(UINT32 Vector, UINT32 ErrorCode, UINT64 FaultingGpa)
 {
-    UNREFERENCED_PARAMETER(FaultingGpa);
-
     // VM-entry interruption-information field (SDM Vol 3C 24.8.3):
     //   bit 31    = valid
+    //   bit 11    = deliver error code
     //   bits 10:8 = interruption type (3 = hardware exception)
     //   bits 7:0  = vector
+    //
+    // Vectors that architecturally push an error code onto the stack:
+    //   #DF (8), #TS (10), #NP (11), #SS (12), #GP (13), #PF (14),
+    //   #AC (17), #CP (21), #VC (29), #SX (30).
+    // Failing to set bit 11 for those vectors, or setting it for the
+    // others, causes a VM-entry consistency failure.
+    BOOLEAN hasErrorCode = (Vector == 8  || Vector == 10 || Vector == 11 ||
+                            Vector == 12 || Vector == 13 || Vector == 14 ||
+                            Vector == 17 || Vector == 21 || Vector == 29 ||
+                            Vector == 30);
+
     UINT32 info = (1U << 31) | (3U << 8) | (Vector & 0xFF);
+
+    if (hasErrorCode) {
+        info |= (1U << 11);
+        VmWrite32(VMCS_ENTRY_EXCEPTION_ERR, ErrorCode);
+
+        // #PF requires the faulting linear address in GUEST_CR2. For an
+        // EPT violation the address delivered here is the GPA the guest
+        // faulted on (the exit handler supplies it via FaultingGpa).
+        if (Vector == 14) {
+            VmWrite64(VMCS_GUEST_CR2, FaultingGpa);
+        }
+    } else {
+        info &= ~(1U << 11);
+        VmWrite32(VMCS_ENTRY_EXCEPTION_ERR, 0);
+    }
+
     VmWrite32(VMCS_ENTRY_INTR_INFO, info);
-    VmWrite32(VMCS_ENTRY_EXCEPTION_ERR, ErrorCode);
 }
 
 static VOID VmxInvalidateTlbAll(VOID)
 {
-    // All-context INVEPT: invalidate every EP4TA on the current CPU.
-    // SDM Vol 3C 25.6.11: type 2 ignores the descriptor contents.
-    __declspec(align(16)) struct { UINT64 A; UINT64 B; } desc = { 0, 0 };
-    _invept(2, &desc);
+    // Full EPT flush: local INVEPT plus a cross-core broadcast so every
+    // logical CPU drops stale translations of the shared EPTP.
+    EptInveptLocalAll();
+    EptInveptBroadcast();
 }
