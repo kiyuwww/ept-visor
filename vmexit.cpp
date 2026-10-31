@@ -1,31 +1,50 @@
-// vmexit.cpp — Master VM-exit dispatcher (Intel VMX + AMD SVM).
-// Unified dual-vendor exit routing, instruction emulation, EPT/NPF resolution,
-// single-step guarded memory-violation recovery, and authenticated teardown
-// hypercall handling.
+// ============================================================================
+//  vmexit.cpp — master VM-exit dispatcher (Intel VMX + AMD SVM).
+//
+//  Both assembly entry stubs (VmxVmExitEntry / SvmVmExitEntry) push the live
+//  GPR frame and call into this module. The dispatcher owns exit routing,
+//  CPUID emulation, EPT/NPF resolution, single-step guarded recovery, and
+//  authenticated teardown hypercalls.
+//
+//  Register-file contract (the core asymmetry between the two vendors):
+//
+//    Intel VMX does not swap GPRs on #VMEXIT at all — every guest register
+//    is still live in the CPU when the stub pushes it, so the full frame in
+//    GuestRegs is the guest state and VMCS_GUEST_RIP is advanced explicitly
+//    by the instruction-length field.
+//
+//    AMD #VMEXIT microcodes RAX, RSP and RIP into the VMCB save area and
+//    reloads host RAX/RSP/RIP from the pre-VMRUN context. The remaining
+//    GPRs are not swapped, so GuestRegs holds guest RBX..R15 but the HOST
+//    RAX. Any AMD path that touches guest RAX must therefore go through
+//    Vmcb->Save.Rax, and any RIP advance must use Vmcb->Control.Nrip
+//    (NextRip, populated by hardware when CPUID Fn8000_000A EDX.NRIPS is
+//    set). Writing GuestRegs[RegRax] on AMD would corrupt host state and
+//    silently discard the CPUID result.
+//
+//  Shutdown contract: g_ShuttingDown never disables exit interception. The
+//  shutdown fast path runs after exit-reason decode and routes a teardown
+//  hypercall straight to its handler; every other exit is stepped past so a
+//  winding-down core always makes forward progress instead of spinning on
+//  the same guest instruction.
+// ============================================================================
 
 #include <ntddk.h>
 #include <intrin.h>
 #include "common.h"
 
 // -----------------------------------------------------------------------------
-// Backend-provided externals (implemented in intel_vmm.cpp / amd_npt.cpp).
-// These are the per-vendor entry points used only after policy has been
-// validated by this module.
+//  Vendor teardown primitives (implemented in intel_vmm.cpp / amd_svm.cpp).
+//  They perform the vendor-specific step-down (VMXOFF path / EFER.SVME clear)
+//  and are invoked only after cryptographic authorization has passed.
 // -----------------------------------------------------------------------------
-extern "C" {
-    VOID IntelHandleTeardownVmcall(_Inout_ UINT64* GuestRegs, _Inout_ PCPU_CONTEXT Cpu);
-    VOID SvmHandleTeardownVmcall  (_Inout_ UINT64* GuestRegs, _Inout_ PCPU_CONTEXT Cpu);
-
-    // Permanently grant read access to a protected page for the guest. The
-    // backend is responsible for updating the EPT/NPT entry and invalidating
-    // the current core's TLB for that page.
-    BOOLEAN IntelGrantPageRead(_Inout_ PCPU_CONTEXT Cpu, _In_ UINT64 GuestPhysicalPage);
-    BOOLEAN AmdGrantPageRead  (_Inout_ PCPU_CONTEXT Cpu, _In_ UINT64 GuestPhysicalPage);
-}
+NTSTATUS IntelHandleTeardownVmcall(PPCPU_CONTEXT Cpu);
+NTSTATUS SvmHandleTeardownVmcall(PPCPU_CONTEXT Cpu);
 
 // -----------------------------------------------------------------------------
-// Guest register frame index layout. Matches the layout pushed by the assembly
-// stubs before they C-call into this module.
+//  Guest register frame index layout. Matches the layout pushed by the
+//  assembly stubs before they C-call into this module. On AMD, slot RegRax
+//  carries the host RAX and must never be read as guest state.
 // -----------------------------------------------------------------------------
 enum : UINT32 {
     RegRax = 0, RegRcx = 1, RegRdx = 2, RegRbx = 3,
@@ -34,66 +53,72 @@ enum : UINT32 {
     RegR12 = 12, RegR13 = 13, RegR14 = 14, RegR15 = 15
 };
 
-// -----------------------------------------------------------------------------
-// Local constants and structures.
-// -----------------------------------------------------------------------------
-static const UINT64 kPage4kMask        = 0xFFFFFFFFFFFFF000ULL;
-static const UINT32 kExceptionDb       = 1;     // #DB architectural vector.
+static const UINT64 kPage4kMask   = 0xFFFFFFFFFFFFF000ULL;
+static const UINT32 kExceptionDb  = 1;    // #DB architectural vector
+static const UINT32 kExceptionPf  = 14;   // #PF architectural vector
 
+// #PF error-code bits (Intel SDM Vol 3A 4.7 / AMD APM Vol 2 8.4)
+#define PF_EC_PRESENT                   0x01
+#define PF_EC_WRITE                     0x02
+#define PF_EC_USER                      0x04
+#define PF_EC_FETCH                     0x10
+
+// -----------------------------------------------------------------------------
+//  Exit qualification decoders.
+//
+//  Intel EPT violation (SDM Vol 3C, Table 28-7):
+//    bit 0  data read, bit 1 data write, bit 2 instruction fetch
+//    bit 3  EPT read permission for the GPA (1 = reads were permitted)
+//    bit 4  EPT write permission, bit 5 EPT execute permission
+//    bit 6  guest linear address validity — GUEST_LINEAR_ADDRESS is only
+//           architecturally defined for this exit when this bit is set;
+//           bit 7 is reserved
+//    bit 12 guest physical address validity
+//
+//  AMD NPF (APM Vol 2, 15.21): Control.ExitInfo1 mirrors the native #PF
+//  error code (P[0] W[1] U/S[2] R[3] I/D[4]) and Control.ExitInfo2 carries
+//  the faulting guest physical address.
+// -----------------------------------------------------------------------------
 union EPT_EXIT_QUALIFICATION {
     UINT64 Value;
     struct {
-        UINT64 Read               : 1;   // bit 0
-        UINT64 Write              : 1;   // bit 1
-        UINT64 Execute            : 1;   // bit 2
-        UINT64 InstFetch          : 1;   // bit 3 (valid when Execute=1)
-        UINT64 Reserved0          : 8;   // bits 4-11
-        UINT64 GuestLinearValid   : 1;   // bit 12
-        UINT64 Reserved1          : 51;
+        UINT64 Read          : 1;   // bit 0
+        UINT64 Write         : 1;   // bit 1
+        UINT64 Execute       : 1;   // bit 2
+        UINT64 EptReadPerm   : 1;   // bit 3
+        UINT64 EptWritePerm  : 1;   // bit 4
+        UINT64 EptExecPerm   : 1;   // bit 5
+        UINT64 GlaValid      : 1;   // bit 6 — GLA defined only when set
+        UINT64 Reserved0     : 5;   // bits 11:7
+        UINT64 GpaValid      : 1;   // bit 12
+        UINT64 Reserved1     : 51;
     };
 };
 
 union NPF_EXITINFO1 {
     UINT64 Value;
     struct {
-        UINT64 Present            : 1;   // bit 0: 1=protection, 0=not-present
-        UINT64 Write              : 1;   // bit 1
-        UINT64 Read               : 1;   // bit 2
-        UINT64 Execute            : 1;   // bit 3
-        UINT64 Reserved           : 60;
+        UINT64 Present       : 1;   // bit 0: 1 = protection violation, 0 = not-present
+        UINT64 Write         : 1;   // bit 1
+        UINT64 User          : 1;   // bit 2: U/S
+        UINT64 Read          : 1;   // bit 3: R — read access
+        UINT64 Execute       : 1;   // bit 4: I/D — instruction fetch
+        UINT64 Reserved      : 59;
     };
 };
 
-// -----------------------------------------------------------------------------
-// VMCS accessors. Wrappers keep the handler body free of intrinsic noise and
-// allow future switch to a cached VMCS mapping without touching call sites.
-// -----------------------------------------------------------------------------
-static __forceinline UINT64
-ReadVmcsField(_In_ UINT32 Field)
-{
-    UINT64 value = 0;
-    (VOID)__vmx_vmread(Field, &value);
-    return value;
-}
-
-static __forceinline VOID
-WriteVmcsField(_In_ UINT32 Field, _In_ UINT64 Value)
-{
-    (VOID)__vmx_vmwrite(Field, Value);
-}
-
 // =============================================================================
-// CPUID emulation.
+//  CPUID emulation — Intel form.
 //
-// CPUID is a fixed-width, side-effect-free instruction. The guest selects the
-// leaf in EAX and the sub-leaf in ECX. The host executes the native CPUID with
-// the guest-selected selectors and writes back the four 32-bit outputs. Each
-// destination register is zero-extended: architectural CPUID outputs are 32-bit
-// and the upper 32 bits of RAX/RBX/RCX/RDX must be cleared on write-back, or
-// subsequent guest 64-bit reads observe stale garbage in the high halves.
+//  CPUID is fixed-width and side-effect-free. The guest selects the leaf in
+//  EAX and the sub-leaf in ECX; the host executes the native CPUID with
+//  those selectors and writes the four 32-bit outputs back, each explicitly
+//  zero-extended: architectural CPUID outputs are 32-bit and the upper
+//  halves of RAX/RBX/RCX/RDX must be cleared or subsequent guest 64-bit
+//  reads observe stale garbage. The full guest GPR set is live in the stub
+//  frame, so all four destinations are GuestRegs slots.
 // =============================================================================
-static VOID
-HandleCpuidExit(_Inout_ UINT64* GuestRegs)
+static VOID HandleCpuidExitIntel(_Inout_ UINT64* GuestRegs)
 {
     int regs[4] = { 0, 0, 0, 0 };
 
@@ -102,8 +127,6 @@ HandleCpuidExit(_Inout_ UINT64* GuestRegs)
 
     __cpuidex(regs, (int)leaf, (int)subleaf);
 
-    // `(UINT64)(UINT32)value` is the explicit 64-bit zero-extension required by
-    // CPUID semantics; it is equivalent to masking with 0x00000000FFFFFFFF.
     GuestRegs[RegRax] = (UINT64)(UINT32)regs[0];
     GuestRegs[RegRbx] = (UINT64)(UINT32)regs[1];
     GuestRegs[RegRcx] = (UINT64)(UINT32)regs[2];
@@ -111,227 +134,344 @@ HandleCpuidExit(_Inout_ UINT64* GuestRegs)
 }
 
 // =============================================================================
-// Unified memory-violation resolver.
+//  CPUID emulation — AMD form.
 //
-// Called for Intel EPT violations and AMD nested page faults. The caller has
-// already decoded read / write / execute intent from the vendor-specific
-// qualification word; this routine only deals with the shared policy engine.
+//  Identical semantics, different register file: the leaf selector lives in
+//  Vmcb->Save.Rax (hardware-saved guest RAX), the sub-leaf arrives in the
+//  stub frame (guest RCX is not swapped by #VMEXIT), and only the RAX
+//  result is written back through the VMCB save area. RBX/RCX/RDX results
+//  go back through the stub frame, which still aliases the guest GPRs.
+// =============================================================================
+static VOID HandleCpuidExitAmd(_Inout_ PVMCB Vmcb, _Inout_ UINT64* GuestRegs)
+{
+    int regs[4] = { 0, 0, 0, 0 };
+
+    const UINT32 leaf    = (UINT32)(Vmcb->Save.Rax & 0xFFFFFFFFULL);
+    const UINT32 subleaf = (UINT32)(GuestRegs[RegRcx] & 0xFFFFFFFFULL);
+
+    __cpuidex(regs, (int)leaf, (int)subleaf);
+
+    Vmcb->Save.Rax    = (UINT64)(UINT32)regs[0];
+    GuestRegs[RegRbx] = (UINT64)(UINT32)regs[1];
+    GuestRegs[RegRcx] = (UINT64)(UINT32)regs[2];
+    GuestRegs[RegRdx] = (UINT64)(UINT32)regs[3];
+}
+
+// =============================================================================
+//  RIP advancement.
+// =============================================================================
+
+// Intel: VMX never auto-advances GUEST_RIP; the hardware-supplied
+// VMCS_EXIT_INSTRUCTION_LENGTH is the only architecturally correct step.
+static __forceinline VOID VmxAdvanceRip(_In_ UINT64 GuestRip, _In_ UINT64 InstrLength)
+{
+    VmWrite64(VMCS_GUEST_RIP, GuestRip + InstrLength);
+}
+
+// AMD: Control.Nrip holds RIP+len of the exiting instruction for every exit
+// this dispatcher advances (NRIPS is verified during the capability audit).
+// A zero Nrip means the facility is unavailable on this core — fall back to
+// the fixed encoding length of the exiting instruction.
+static __forceinline VOID SvmAdvanceRip(_Inout_ PVMCB Vmcb, _In_ UINT64 FallbackLength)
+{
+    const UINT64 nrip = Vmcb->Control.Nrip;
+    Vmcb->Save.Rip = (nrip != 0) ? nrip : (Vmcb->Save.Rip + FallbackLength);
+}
+
+// =============================================================================
+//  Architectural denial — guest #PF synthesis.
 //
-// Resolution policy:
-//   * Unprotected page            -> no action (backend fault would not occur).
-//   * Read-only attempt           -> permanently grant read on the page.
-//   * Write or execute attempt    -> single-step isolation:
-//        1. Atomically save the original strict PTE state onto the Cpu context.
-//        2. Relax permissions for the current core only.
-//        3. Arm the single-step framework and flag the Cpu.
-//       Adjacent cores that wish to single-step the same page spin on a pause
-//       loop to serialize access to the shared PTE slot — otherwise concurrent
-//       relaxations of the same table page can stack and defeat protection.
+//  When a fault cannot be resolved by policy (page outside every protected
+//  range, or an outstanding single-step on this core), the access is denied
+//  by injecting a not-present #PF into the guest architectural state. The
+//  vendor backend routes the fault address into CR2 (VMCS_GUEST_CR2 / the
+//  VMCB CR2 save field) before the next VMRESUME/VMRUN, so the guest OS
+//  delivers it to the faulting thread exactly as hardware would. The fault
+//  address must be the guest LINEAR address; the GPA produced by the EPT/NPT
+//  walk is used only as a last resort when no valid GLA is available.
+// =============================================================================
+static VOID InjectDenialPageFault(
+    _In_ PPCPU_CONTEXT Cpu,
+    _In_ UINT64        FaultAddress,
+    _In_ BOOLEAN       IsWrite,
+    _In_ BOOLEAN       IsExecute,
+    _In_ BOOLEAN       UserMode
+    )
+{
+    UINT32 errorCode = 0;                       // P = 0: not-present denial
+    if (IsWrite)   errorCode |= PF_EC_WRITE;
+    if (UserMode)  errorCode |= PF_EC_USER;
+    if (IsExecute) errorCode |= PF_EC_FETCH;
+
+    (VOID)g_HvOps->InjectException(Cpu, kExceptionPf, errorCode, FaultAddress);
+}
+
+// =============================================================================
+//  Unified memory-violation resolver.
+//
+//  Called for Intel EPT violations and AMD nested page faults. The caller
+//  has already decoded the access intent from the vendor qualification word;
+//  this routine owns the policy engine and the single-step trap-flip.
+//
+//  Resolution policy:
+//    * Page outside every protected range -> architectural #PF denial.
+//    * Access fully allowed by policy     -> stale/edge fault (TLB lag after
+//      a restore); grant the attempted access and let it re-execute.
+//    * Read-only probe                    -> granted once, permanently: the
+//      protection model hides pages from bulk scans until a legitimate
+//      reader touches them, then the read permission stays open.
+//    * Write or execute attempt           -> single-step isolation:
+//        1. SaveEntry journals the raw strict leaf into Cpu->SavedPteValue
+//           and the page into Cpu->SingleStepPageGpa (per-core state — no
+//           cross-core tracking slot exists, so two cores can isolate
+//           different pages concurrently without collision).
+//        2. RelaxPermissions re-opens only the attempted access for this
+//           core; other cores keep their strict TLB state.
+//        3. ArmSingleStep arms MTF (Intel) / RFLAGS.TF+#DB (AMD).
+//      The very next guest instruction triggers the completion exit, which
+//      restores the journaled leaf and re-seals the page.
+//
+//  Locking discipline: only SpinAcquire(&g_RangesLock) — a bare CMPXCHG lock
+//  with no IRQL manipulation. Blocking primitives such as
+//  KeAcquireSpinLockRaiseToDpc are forbidden in root context: raising IRQL
+//  here would deadlock against the lock-order inversion between the range
+//  lock and any paged code path the guest interrupted.
 // =============================================================================
 static BOOLEAN
 HandleMemoryViolation(
-    _Inout_ PCPU_CONTEXT Cpu,
-    _In_    UINT64       GuestPhysicalPage,
-    _In_    BOOLEAN      IsRead,
-    _In_    BOOLEAN      IsWrite,
-    _In_    BOOLEAN      IsExecute
+    _In_ PPCPU_CONTEXT Cpu,
+    _In_ UINT64        GuestPhysicalAddress,
+    _In_ BOOLEAN       IsRead,
+    _In_ BOOLEAN       IsWrite,
+    _In_ BOOLEAN       IsExecute,
+    _In_ UINT64        GuestLinearAddress,
+    _In_ BOOLEAN       GuestLinearValid,
+    _In_ BOOLEAN       GuestUserMode
     )
 {
-    const UINT64 pageAddr = GuestPhysicalPage & kPage4kMask;
+    const UINT64 page = GuestPhysicalAddress & kPage4kMask;
 
-    KIRQL irql = KeAcquireSpinLockRaiseToDpc(&g_RangesLock);
+    // ---- Phase 1: policy interrogation under a short lock zone. ----
+    ULONG ownerPid     = 0;
+    ULONG allowedPerms = 0;
+    BOOLEAN isProtected;
 
-    PROTECTED_RANGE range = { 0 };
-    BOOLEAN found = FALSE;
+    SpinAcquire(&g_RangesLock);
+    isProtected = PolicyLookup(page, &ownerPid, &allowedPerms);
+    SpinRelease(&g_RangesLock);
 
-    for (;;) {
-        // Serialize against other cores currently single-stepping this page.
-        // The check is performed while the ranges lock is held, but the spin
-        // itself runs lock-free so that the owner can complete its single-step
-        // and re-enter this handler to clear the tracking slot.
-        if (g_ActiveSingleStepPage == pageAddr) {
-            KeReleaseSpinLock(&g_RangesLock, irql);
-            while (g_ActiveSingleStepPage == pageAddr) {
-                _mm_pause();
-            }
-            irql = KeAcquireSpinLockRaiseToDpc(&g_RangesLock);
-            continue;
-        }
-
-        found = PolicyLookup(pageAddr, &range);
-        break;
-    }
-
-    if (!found) {
-        KeReleaseSpinLock(&g_RangesLock, irql);
+    if (!isProtected) {
+        // Not ours to adjudicate: deny the access architecturally. Prefer
+        // the guest linear address for CR2 precision when hardware supplied
+        // one; otherwise the GPA is the only addressable witness.
+        const UINT64 faultAddress = (GuestLinearValid && GuestLinearAddress != 0)
+                                  ? GuestLinearAddress
+                                  : GuestPhysicalAddress;
+        InjectDenialPageFault(Cpu, faultAddress, IsWrite, IsExecute, GuestUserMode);
         return FALSE;
     }
 
-    // Read-only attempt: permanently grant read on this page. The backend
-    // updates the EPT/NPT entry and invalidates the current-core TLB.
-    if (IsRead && !IsWrite && !IsExecute) {
-        KeReleaseSpinLock(&g_RangesLock, irql);
+    const ULONG attempted = (ULONG)((IsRead    ? NPT_PERM_READ    : 0) |
+                                    (IsWrite   ? NPT_PERM_WRITE   : 0) |
+                                    (IsExecute ? NPT_PERM_EXECUTE : 0));
 
-        if (IntelGrantPageRead != NULL) {
-            // The backend module registers the correct grant primitive based
-            // on its vendor at runtime; calling it unconditionally is safe
-            // because the wrong-vendor grant returns FALSE without side effect.
-            (VOID)IntelGrantPageRead(Cpu, pageAddr);
-            (VOID)AmdGrantPageRead(Cpu, pageAddr);
-        }
+    // ---- Access fully covered by policy: stale fault after a restore —
+    //      reopen the attempted access and re-execute. ----
+    if (attempted != 0 && (attempted & ~allowedPerms) == 0) {
+        SpinAcquire(&g_RangesLock);
+        (VOID)g_HvOps->RelaxPermissions(Cpu, page, attempted);
+        SpinRelease(&g_RangesLock);
         return TRUE;
     }
 
-    // Write / execute attempt: enter single-step isolation.
-    if (Cpu->SingleStepPending) {
-        // A previous single-step is still outstanding on this core. The Cpu
-        // must have drained it before we can arm another; reaching this point
-        // indicates a lost completion exit. Bail out and let the outer loop
-        // re-enter, which will surface the fault to the diagnostic path.
-        KeReleaseSpinLock(&g_RangesLock, irql);
+    // ---- Read-only probe: grant read permanently, then re-execute. ----
+    if (IsRead && !IsWrite && !IsExecute) {
+        SpinAcquire(&g_RangesLock);
+        (VOID)g_HvOps->RelaxPermissions(Cpu, page, NPT_PERM_READ);
+        SpinRelease(&g_RangesLock);
+        return TRUE;
+    }
+
+    // ---- Write / execute attempt: single-step isolation. ----
+    if (Cpu->SingleStepPending != 0) {
+        // A previous single-step is still outstanding on this core; the
+        // completion exit has not drained it. Deny rather than stacking a
+        // second relaxation — the journaled leaf would be overwritten and
+        // the original protection lost.
+        const UINT64 faultAddress = (GuestLinearValid && GuestLinearAddress != 0)
+                                  ? GuestLinearAddress
+                                  : GuestPhysicalAddress;
+        InjectDenialPageFault(Cpu, faultAddress, IsWrite, IsExecute, GuestUserMode);
         return FALSE;
     }
 
-    // Save the exact original PTE mapping onto the Cpu context. The backend
-    // captures both the EPT/NPT slot value and any auxiliary permission bits.
-    g_HvOps->SaveEntry(Cpu, pageAddr, &Cpu->SavedProtection);
+    SpinAcquire(&g_RangesLock);
 
-    // Relax permissions for the current core only. Other cores keep their TLB
-    // entries pointing at the original strict PTE, so the relaxation is
-    // invisible outside this core.
-    g_HvOps->RelaxPermissions(Cpu, pageAddr);
+    // Journal the strict leaf onto the per-core context; the completion
+    // handler restores exactly this descriptor image.
+    (VOID)g_HvOps->SaveEntry(Cpu, page);
 
-    // Arm the single-step framework (Intel: MTF; AMD: TF/RF + #DB intercept).
+    // Re-open only the attempted access for the re-execution window.
+    (VOID)g_HvOps->RelaxPermissions(Cpu, page, attempted);
+
+    // Arm the hardware trap: MTF on Intel, RFLAGS.TF + #DB on AMD.
     g_HvOps->ArmSingleStep(Cpu);
 
-    Cpu->SingleStepPage    = pageAddr;
-    Cpu->SingleStepPending = TRUE;
+    Cpu->SingleStepPageGpa  = page;
+    Cpu->SingleStepFlipped  = TRUE;
+    Cpu->SingleStepPending  = 1;
 
-    // Publish the tracked page for adjacent-core serialization.
-    InterlockedExchange64((volatile LONG64*)&g_ActiveSingleStepPage,
-                          (LONG64)pageAddr);
-
-    KeReleaseSpinLock(&g_RangesLock, irql);
+    SpinRelease(&g_RangesLock);
     return TRUE;
 }
 
 // =============================================================================
-// Single-step completion handler.
+//  Single-step completion handler.
 //
-// Intel: MONITOR_TRAP_FLAG exit. AMD: SVM_EXIT_EXCP_BASE + 1 (#DB intercept).
+//  Intel: MONITOR_TRAP_FLAG exit. AMD: SVM_EXIT_EXCP_BASE + 1 (#DB intercept).
 //
-// If Cpu->SingleStepPending is set, this completion belongs to us: restore the
-// original strict protection, disarm single-step, broadcast a TLB shootdown so
-// every core observes the restored mapping, and clear the execution flags.
+//  If Cpu->SingleStepPending is set, the trap belongs to the isolation
+//  engine: restore the journaled strict leaf, disarm the trap, flush the
+//  core's translation caches so the sealed mapping is observed on re-entry,
+//  and clear the per-core tracking state. RestoreEntry consumes
+//  Cpu->SavedPteValue / Cpu->SingleStepPageGpa directly — no global state.
 //
-// If Cpu->SingleStepPending is clear on AMD, this #DB was guest-native
-// (debugger or hardware breakpoint). We must not swallow it — reinject #DB
-// through the intercept path so the guest debugger keeps working.
+//  If the flag is clear on AMD, this #DB is a guest-native breakpoint
+//  (debugger or DR7 hardware match). Swallowing it would silently vanish
+//  the guest debugger; the event is reinjected through EVENTINJ with the
+//  #DB vector so it is delivered at the next VMRUN exactly as raised.
+//  On Intel, #DB is not intercepted in this design, so a pending-less MTF
+//  exit is treated as spurious and discarded.
 // =============================================================================
 static VOID
 HandleSingleStepCompletion(
-    _Inout_ PCPU_CONTEXT Cpu,
-    _In_    BOOLEAN      IsIntel
+    _In_ PPCPU_CONTEXT Cpu,
+    _In_ BOOLEAN       IsIntel
     )
 {
-    if (!Cpu->SingleStepPending) {
-        if (!IsIntel) {
-            // Guest-native #DB. Reinject into the guest context.
-            g_HvOps->InjectException(Cpu, kExceptionDb, 0, 0);
-        }
+    if (Cpu->SingleStepPending != 0) {
+        SpinAcquire(&g_RangesLock);
+
+        g_HvOps->RestoreEntry(Cpu);
+        g_HvOps->DisarmSingleStep(Cpu);
+        g_HvOps->InvalidateTlbAll(Cpu);
+
+        Cpu->SingleStepPending  = 0;
+        Cpu->SingleStepPageGpa  = 0;
+        Cpu->SavedPteValue      = 0;
+        Cpu->SingleStepFlipped  = FALSE;
+
+        SpinRelease(&g_RangesLock);
         return;
     }
 
-    KIRQL irql = KeAcquireSpinLockRaiseToDpc(&g_RangesLock);
-
-    g_HvOps->RestoreEntry(Cpu);
-    g_HvOps->DisarmSingleStep(Cpu);
-    g_HvOps->InvalidateTlbAll(Cpu);
-
-    Cpu->SingleStepPending = FALSE;
-    Cpu->SingleStepPage    = 0;
-
-    InterlockedExchange64((volatile LONG64*)&g_ActiveSingleStepPage, 0);
-
-    KeReleaseSpinLock(&g_RangesLock, irql);
+    if (!IsIntel) {
+        (VOID)g_HvOps->InjectException(Cpu, kExceptionDb, 0, 0);
+    }
 }
 
 // =============================================================================
-// Hypercall handler.
+//  Authenticated teardown hypercall.
 //
-// Only a single authenticated hypercall is recognized: HV_HYPERCALL_TEARDOWN.
-// Because an arbitrary untrusted Ring 0 driver could otherwise disable memory
-// security defenses, the teardown hypercall requires a pre-shared cryptographic
-// verification secret. Nonce and signature are supplied in guest registers by
-// the caller and validated by the HV operations layer.
+//  Contract: RAX carries the hypercall token, RBX a one-shot nonce and RCX
+//  an HMAC-style signature over it. On AMD the token is read from
+//  Vmcb->Save.Rax — GuestRegs[RegRax] holds the host RAX and would never
+//  match the token. Nonce and signature live in guest RBX/RCX, which are
+//  not swapped by #VMEXIT and are therefore valid in the stub frame.
+//
+//  VerifyHypercallAuth is constant-time and replay-protected: a nonce
+//  window is tracked per caller, so a captured (nonce, signature) pair
+//  cannot be replayed. A rejected call is a security event, not a crash —
+//  the alarm is logged and the guest resumes at the next instruction; the
+//  caller advances RIP either way so no core can spin on the VMMCALL.
 // =============================================================================
 static VOID
-HandleHypercall(
-    _Inout_ UINT64*      GuestRegs,
-    _Inout_ PCPU_CONTEXT Cpu,
-    _In_    BOOLEAN      IsIntel
+HandleTeardownHypercall(
+    _In_ PPCPU_CONTEXT Cpu,
+    _Inout_ UINT64*    GuestRegs,
+    _In_ BOOLEAN       IsIntel
     )
 {
-    const UINT64 hypercallId = GuestRegs[RegRax];
+    const UINT64 hypercallId = IsIntel
+                             ? GuestRegs[RegRax]
+                             : ((PVMCB)Cpu->VmcbVa)->Save.Rax;
 
-    if (hypercallId != (UINT64)HV_HYPERCALL_TEARDOWN) {
-        // Unknown hypercall — ignore and advance past the instruction.
+    if (hypercallId != HV_HYPERCALL_TEARDOWN)
         return;
-    }
 
-    // Cryptographic verification: nonce in RBX, HMAC-style signature in RCX.
-    // Any failure is a silent reject; we must not surface a distinguishable
-    // status to the caller or an attacker gains an oracle.
     const UINT64 nonce     = GuestRegs[RegRbx];
     const UINT64 signature = GuestRegs[RegRcx];
 
-    if (!g_HvOps->VerifyHypercallAuth(nonce, signature)) {
+    UINT64 secretKey = 0;
+    if (!VerifyHypercallAuth(nonce, signature, &secretKey)) {
+        DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "[vmexit] SECURITY: teardown hypercall auth rejected "
+            "(cpu=%u nonce=%llx)\n", Cpu->CpuIndex, nonce);
         return;
     }
 
     if (IsIntel) {
-        IntelHandleTeardownVmcall(GuestRegs, Cpu);
+        (VOID)IntelHandleTeardownVmcall(Cpu);
     } else {
-        SvmHandleTeardownVmcall(GuestRegs, Cpu);
+        (VOID)SvmHandleTeardownVmcall(Cpu);
     }
 }
 
 // =============================================================================
-// Fatal-exit diagnostic + safe host recovery loop.
+//  General hypercall router (normal, non-shutdown path).
 //
-// Reached for VMEXIT_INVALID and for any exit code the master dispatcher does
-// not recognize. Execution context is logged once, the shutdown flag is
-// latched, and the current core is parked in a low-power recovery loop while
-// the rest of the system observes the teardown request.
+//  Only the teardown token is recognized; any other token is an untrusted
+//  probe and the guest resumes past it. RIP advance is owned by the caller
+//  for both vendors.
+// =============================================================================
+static VOID
+HandleHypercall(
+    _In_ PPCPU_CONTEXT Cpu,
+    _Inout_ UINT64*    GuestRegs,
+    _In_ BOOLEAN       IsIntel
+    )
+{
+    HandleTeardownHypercall(Cpu, GuestRegs, IsIntel);
+}
+
+// =============================================================================
+//  Fatal-exit diagnostic + host recovery.
+//
+//  Reached for VMEXIT_INVALID and any exit code the dispatcher does not
+//  recognize. Register context is logged with vendor-correct values, the
+//  shutdown latch is set so the remaining cores wind down, and this core is
+//  parked: returning would resume a guest whose VMCB/VMCS state just proved
+//  to be untrustworthy, and an infinite VMEXIT storm on the same instruction
+//  is worse than a quiesced core.
 // =============================================================================
 static VOID
 FatalHostRecovery(
-    _In_ UINT32  ExitReason,
-    _In_ UINT64  Qualification,
-    _In_ UINT64  GuestRip,
-    _In_ UINT64* GuestRegs
+    _In_ UINT32 ExitReason,
+    _In_ UINT64 Qualification,
+    _In_ UINT64 GuestRip,
+    _In_ UINT64 Rax,
+    _In_ UINT64 Rbx,
+    _In_ UINT64 Rcx,
+    _In_ UINT64 Rdx
     )
 {
-    DbgPrint("[vmexit] FATAL exit=0x%08X qual=0x%016llX rip=0x%016llX "
-             "rax=0x%016llX rbx=0x%016llX rcx=0x%016llX rdx=0x%016llX\n",
-             ExitReason,
-             Qualification,
-             GuestRip,
-             GuestRegs[RegRax],
-             GuestRegs[RegRbx],
-             GuestRegs[RegRcx],
-             GuestRegs[RegRdx]);
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+        "[vmexit] FATAL exit=0x%08X qual=0x%016llX rip=0x%016llX "
+        "rax=0x%016llX rbx=0x%016llX rcx=0x%016llX rdx=0x%016llX\n",
+        ExitReason, Qualification, GuestRip, Rax, Rbx, Rcx, Rdx);
 
     InterlockedExchange(&g_ShuttingDown, 1);
 
     for (;;) {
-        KeStallExecutionProcessor(100);
-        YieldProcessor();
+        _mm_pause();
     }
 }
 
 // =============================================================================
-// Intel VMX master exit dispatcher.
+//  Intel VMX master exit dispatcher.
+//
+//  All guest GPR traffic flows through the stub frame (VMX does not swap
+//  GPRs on exit); RIP advances are explicit via VMCS_EXIT_INSTRUCTION_LENGTH.
 // =============================================================================
 extern "C"
 VOID
@@ -339,51 +479,67 @@ VmxVmExitHandlerC(
     _Inout_ UINT64* GuestRegs
     )
 {
-    PCPU_CONTEXT Cpu = GetCurrentCpuContext();
+    PPCPU_CONTEXT Cpu = GetCurrentCpuContext();
 
-    const UINT64 rawReason     = ReadVmcsField(VMCS_EXIT_REASON);
-    const UINT64 qualification = ReadVmcsField(VMCS_EXIT_QUALIFICATION);
-    const UINT64 guestRip      = ReadVmcsField(VMCS_GUEST_RIP);
-    const UINT64 instrLength   = ReadVmcsField(VMCS_EXIT_INSTRUCTION_LENGTH);
+    const UINT64 rawReason     = VmRead64(VMCS_EXIT_REASON);
+    const UINT64 qualification = VmRead64(VMCS_EXIT_QUALIFICATION);
+    const UINT64 guestRip      = VmRead64(VMCS_GUEST_RIP);
+    const UINT64 instrLength   = VmRead64(VMCS_EXIT_INSTRUCTION_LENGTH);
     const UINT32 exitReason    = (UINT32)(rawReason & 0xFFFF);
 
-    // Fast shutdown path: skip all policy, only advance RIP for instructions
-    // we would normally consume. This prevents teardown from deadlocking on
-    // a CPUID / hypercall loop while the rest of the system winds down.
-    if (InterlockedCompareExchange(&g_ShuttingDown, 0, 0) != 0) {
-        if (exitReason == EXIT_REASON_CPUID) {
-            HandleCpuidExit(GuestRegs);
-            WriteVmcsField(VMCS_GUEST_RIP, guestRip + instrLength);
-        } else if (exitReason == EXIT_REASON_VMCALL) {
-            WriteVmcsField(VMCS_GUEST_RIP, guestRip + instrLength);
-        } else if (exitReason == EXIT_REASON_MONITOR_TRAP_FLAG) {
-            if (Cpu->SingleStepPending) {
-                HandleSingleStepCompletion(Cpu, TRUE);
-            }
-        }
+    // VMX uses 0xFFFF as the invalid-exit sentinel; a signed comparison
+    // would mask it as a valid reason, so it is filtered before dispatch.
+    if (exitReason == 0xFFFF) {
+        FatalHostRecovery(0xFFFF, qualification, guestRip,
+                          GuestRegs[RegRax], GuestRegs[RegRbx],
+                          GuestRegs[RegRcx], GuestRegs[RegRdx]);
         return;
     }
 
-    // VMX uses 0xFFFF as the "invalid exit reason" sentinel. Handle it before
-    // the switch so a signed comparison never masks it as a valid reason.
-    if ((rawReason & 0xFFFF) == 0xFFFF) {
-        FatalHostRecovery(0xFFFF, qualification, guestRip, GuestRegs);
+    // ---- Shutdown fast path. Exit reason is decoded FIRST so the teardown
+    // hypercall still lands in its handler while g_ShuttingDown is latched;
+    // everything else steps past the instruction to guarantee forward
+    // progress on a winding-down core. ----
+    if (g_ShuttingDown != 0) {
+        if (exitReason == EXIT_REASON_VMCALL &&
+            GuestRegs[RegRax] == HV_HYPERCALL_TEARDOWN) {
+            HandleTeardownHypercall(Cpu, GuestRegs, TRUE);
+            VmxAdvanceRip(guestRip, instrLength);
+            return;
+        }
+
+        switch (exitReason) {
+        case EXIT_REASON_CPUID:
+            HandleCpuidExitIntel(GuestRegs);
+            VmxAdvanceRip(guestRip, instrLength);
+            break;
+        case EXIT_REASON_VMCALL:
+            VmxAdvanceRip(guestRip, instrLength);
+            break;
+        case EXIT_REASON_MONITOR_TRAP_FLAG:
+            if (Cpu->SingleStepPending != 0)
+                HandleSingleStepCompletion(Cpu, TRUE);
+            break;
+        default:
+            // Includes unresolved EPT violations: the faulting instruction
+            // is skipped so the core cannot loop on it during teardown.
+            VmxAdvanceRip(guestRip, instrLength);
+            break;
+        }
         return;
     }
 
     switch (exitReason) {
 
     case EXIT_REASON_CPUID: {
-        HandleCpuidExit(GuestRegs);
-        // VMX does not auto-advance GUEST_RIP; the hardware-provided
-        // instruction length is the only architecturally correct step.
-        WriteVmcsField(VMCS_GUEST_RIP, guestRip + instrLength);
+        HandleCpuidExitIntel(GuestRegs);
+        VmxAdvanceRip(guestRip, instrLength);
         break;
     }
 
     case EXIT_REASON_VMCALL: {
-        HandleHypercall(GuestRegs, Cpu, TRUE);
-        WriteVmcsField(VMCS_GUEST_RIP, guestRip + instrLength);
+        HandleHypercall(Cpu, GuestRegs, TRUE);
+        VmxAdvanceRip(guestRip, instrLength);
         break;
     }
 
@@ -391,17 +547,26 @@ VmxVmExitHandlerC(
         EPT_EXIT_QUALIFICATION eq;
         eq.Value = qualification;
 
-        const UINT64 gpa = ReadVmcsField(VMCS_GUEST_PHYSICAL_ADDRESS);
+        const UINT64 gpa = VmRead64(VMCS_GUEST_PHYSICAL_ADDRESS);
+
+        // GUEST_LINEAR_ADDRESS is architecturally valid only when the
+        // qualification marks it so; it supplies the precise CR2 address
+        // for any #PF denial this fault resolves into.
+        const BOOLEAN glaValid = eq.GlaValid != 0;
+        const UINT64  gla      = glaValid ? VmRead64(VMCS_GUEST_LINEAR_ADDRESS) : 0;
+
+        // Guest privilege for the #PF U/S bit: DPL of the guest CS access
+        // rights (bits 6:5); DPL 3 = user-mode fault.
+        const UINT32 csAr = (UINT32)VmRead64(VMCS_GUEST_CS_AR);
+        const BOOLEAN userMode = ((csAr >> 5) & 3) == 3;
 
         (VOID)HandleMemoryViolation(
-            Cpu,
-            gpa,
-            (BOOLEAN)eq.Read,
-            (BOOLEAN)eq.Write,
-            (BOOLEAN)eq.Execute);
+            Cpu, gpa,
+            (BOOLEAN)eq.Read, (BOOLEAN)eq.Write, (BOOLEAN)eq.Execute,
+            gla, glaValid, userMode);
 
-        // No RIP advance: the instruction must be re-executed after the PTE
-        // has been relaxed or read access has been granted.
+        // No RIP advance: the faulting instruction re-executes after the
+        // permission relaxation takes effect.
         break;
     }
 
@@ -411,14 +576,19 @@ VmxVmExitHandlerC(
     }
 
     default: {
-        FatalHostRecovery(exitReason, qualification, guestRip, GuestRegs);
+        FatalHostRecovery(exitReason, qualification, guestRip,
+                          GuestRegs[RegRax], GuestRegs[RegRbx],
+                          GuestRegs[RegRcx], GuestRegs[RegRdx]);
         break;
     }
     }
 }
 
 // =============================================================================
-// AMD SVM master exit dispatcher.
+//  AMD SVM master exit dispatcher.
+//
+//  RAX, RSP and RIP live in the VMCB save area (hardware-managed); RBX..R15
+//  are guest-live in the stub frame. RIP advancement uses Control.Nrip.
 // =============================================================================
 extern "C"
 VOID
@@ -426,26 +596,43 @@ SvmVmExitHandlerC(
     _Inout_ UINT64* GuestRegs
     )
 {
-    PCPU_CONTEXT Cpu = GetCurrentCpuContext();
+    PPCPU_CONTEXT Cpu = GetCurrentCpuContext();
+    PVMCB Vmcb = (PVMCB)Cpu->VmcbVa;
 
-    const UINT64 exitCode     = Cpu->Vmcb->Control.ExitCode;
-    const UINT64 qualification = Cpu->Vmcb->Control.ExitInfo1;
-    const UINT64 guestRip     = Cpu->Vmcb->StateSave.Rip;
-    const UINT32 exitReason   = (UINT32)(exitCode & 0xFFFFFFFFULL);
+    if (Vmcb == NULL)
+        return;
 
-    // Fast shutdown path: identical semantics to the Intel dispatcher. On AMD
-    // the hardware has already populated Control.Nrip, so advancing RIP is a
-    // single state-save update.
-    if (InterlockedCompareExchange(&g_ShuttingDown, 0, 0) != 0) {
-        if (exitReason == SVM_EXIT_CPUID) {
-            HandleCpuidExit(GuestRegs);
-            Cpu->Vmcb->StateSave.Rip = Cpu->Vmcb->Control.Nrip;
-        } else if (exitReason == SVM_EXIT_VMMCALL) {
-            Cpu->Vmcb->StateSave.Rip = Cpu->Vmcb->Control.Nrip;
-        } else if (exitReason == (SVM_EXIT_EXCP_BASE + 1)) {
-            if (Cpu->SingleStepPending) {
+    const UINT32 exitReason = (UINT32)(Vmcb->Control.ExitCode & 0xFFFFFFFFULL);
+    const UINT64 guestRip   = Vmcb->Save.Rip;
+
+    // ---- Shutdown fast path: identical ordering to the Intel dispatcher —
+    // exit reason decoded first, teardown hypercall routed before any
+    // bypass, everything else stepped past via NextRip. ----
+    if (g_ShuttingDown != 0) {
+        if (exitReason == SVM_EXIT_VMMCALL &&
+            Vmcb->Save.Rax == HV_HYPERCALL_TEARDOWN) {
+            HandleTeardownHypercall(Cpu, GuestRegs, FALSE);
+            SvmAdvanceRip(Vmcb, 3);        // VMMCALL = 0F 01 D9 (3 bytes)
+            return;
+        }
+
+        switch (exitReason) {
+        case SVM_EXIT_CPUID:
+            HandleCpuidExitAmd(Vmcb, GuestRegs);
+            SvmAdvanceRip(Vmcb, 2);        // CPUID = 0F A2 (2 bytes)
+            break;
+        case SVM_EXIT_VMMCALL:
+            SvmAdvanceRip(Vmcb, 3);
+            break;
+        case SVM_EXIT_EXCP_BASE + 1:
+            if (Cpu->SingleStepPending != 0)
                 HandleSingleStepCompletion(Cpu, FALSE);
-            }
+            break;
+        default:
+            // Includes unresolved NPFs: skip the faulting instruction so a
+            // winding-down core cannot spin on the same page fault.
+            SvmAdvanceRip(Vmcb, 0);
+            break;
         }
         return;
     }
@@ -453,48 +640,54 @@ SvmVmExitHandlerC(
     switch (exitReason) {
 
     case SVM_EXIT_CPUID: {
-        HandleCpuidExit(GuestRegs);
-        // AMD hardware has already advanced Control.Nrip past CPUID; propagate
-        // that architecturally-correct value into the state-save RIP so VMRUN
-        // resumes at the next instruction.
-        Cpu->Vmcb->StateSave.Rip = Cpu->Vmcb->Control.Nrip;
+        HandleCpuidExitAmd(Vmcb, GuestRegs);
+        // Hardware populated Control.Nrip past the CPUID; propagate it into
+        // the save-area RIP so VMRUN resumes at the next instruction.
+        SvmAdvanceRip(Vmcb, 2);
         break;
     }
 
     case SVM_EXIT_VMMCALL: {
-        HandleHypercall(GuestRegs, Cpu, FALSE);
-        Cpu->Vmcb->StateSave.Rip = Cpu->Vmcb->Control.Nrip;
+        HandleHypercall(Cpu, GuestRegs, FALSE);
+        SvmAdvanceRip(Vmcb, 3);
         break;
     }
 
     case SVM_EXIT_NPF: {
         NPF_EXITINFO1 info;
-        info.Value = qualification;
+        info.Value = Vmcb->Control.ExitInfo1;
 
-        const UINT64 gpa = Cpu->Vmcb->Control.ExitInfo2;
+        // The faulting guest physical address is delivered explicitly in
+        // ExitInfo2 — it is never derived from ExitInfo1, which is the
+        // native #PF error-code image.
+        const UINT64 gpa = Vmcb->Control.ExitInfo2;
 
         (VOID)HandleMemoryViolation(
-            Cpu,
-            gpa,
+            Cpu, gpa,
             (BOOLEAN)info.Read,
             (BOOLEAN)info.Write,
-            (BOOLEAN)info.Execute);
+            (BOOLEAN)info.Execute,
+            0, FALSE,
+            Vmcb->Save.Cpl == 3);
 
-        // No RIP advance: re-execute the faulting instruction after the
-        // permission fix has taken effect.
+        // No RIP advance: the faulting instruction re-executes after the
+        // permission fix takes effect.
         break;
     }
 
-    case (SVM_EXIT_EXCP_BASE + 1): {
-        // #DB. Either our single-step completion or a guest-native debugger
-        // breakpoint; HandleSingleStepCompletion discriminates and reinjects
-        // guest-native #DB when appropriate.
+    case SVM_EXIT_EXCP_BASE + 1: {
+        // #DB. Either the isolation engine's single-step completion or a
+        // guest-native debugger breakpoint; the completion handler
+        // discriminates on SingleStepPending and reinjects guest-native
+        // #DB via EVENTINJ instead of swallowing it.
         HandleSingleStepCompletion(Cpu, FALSE);
         break;
     }
 
     default: {
-        FatalHostRecovery(exitReason, qualification, guestRip, GuestRegs);
+        FatalHostRecovery(exitReason, Vmcb->Control.ExitInfo1, guestRip,
+                          Vmcb->Save.Rax, GuestRegs[RegRbx],
+                          GuestRegs[RegRcx], GuestRegs[RegRdx]);
         break;
     }
     }
