@@ -3,6 +3,7 @@
 #include <ntddk.h>
 #include <intrin.h>
 #include <stdint.h>
+#include <stddef.h>
 
 // ============================================================================
 //  1. MSRs - Intel VT-x
@@ -39,6 +40,8 @@
 #define MSR_AMD_VM_CR                   0xC0010114
 #define MSR_AMD_VM_HSAVE_PA             0xC0010117
 
+#define SVM_VM_CR_SVMDIS_BIT            (1U << 4)
+
 // ============================================================================
 //  3. Control-register and EFER bits
 // ============================================================================
@@ -74,7 +77,6 @@
 #define X86_RFLAGS_TF                   (1ULL <<  8)
 #define X86_RFLAGS_IF                   (1ULL <<  9)
 
-// IA32_FEATURE_CONTROL bits
 #define FC_LOCK                         (1ULL <<  0)
 #define FC_VMXON_SMX                    (1ULL <<  1)
 #define FC_VMXON_OUTSIDE_SMX            (1ULL <<  2)
@@ -82,7 +84,6 @@
 // ============================================================================
 //  4. VMCS field encodings (Intel SDM Vol 3C App. B)
 // ============================================================================
-// 16-bit
 #define VMCS_VPID                            0x0000
 #define VMCS_GUEST_ES_SEL                    0x0800
 #define VMCS_GUEST_CS_SEL                    0x0802
@@ -99,7 +100,6 @@
 #define VMCS_HOST_FS_SEL                     0x0C08
 #define VMCS_HOST_GS_SEL                     0x0C0A
 #define VMCS_HOST_TR_SEL                     0x0C0C
-// 16-bit natural-width (access rights)
 #define VMCS_GUEST_ES_AR                     0x4814
 #define VMCS_GUEST_CS_AR                     0x4816
 #define VMCS_GUEST_SS_AR                     0x4818
@@ -108,7 +108,6 @@
 #define VMCS_GUEST_GS_AR                     0x481E
 #define VMCS_GUEST_LDTR_AR                   0x4820
 #define VMCS_GUEST_TR_AR                     0x4822
-// 64-bit
 #define VMCS_IO_BITMAP_A                     0x2000
 #define VMCS_IO_BITMAP_B                     0x2002
 #define VMCS_MSR_BITMAP                      0x2004
@@ -130,7 +129,6 @@
 #define VMCS_GUEST_IA32_DEBUGCTL             0x2802
 #define VMCS_GUEST_IA32_PAT                  0x2804
 #define VMCS_GUEST_IA32_EFER                 0x2806
-// 32-bit
 #define VMCS_PIN_BASED_CTLS                  0x4000
 #define VMCS_PROC_BASED_CTLS                 0x4002
 #define VMCS_EXCEPTION_BITMAP                0x4004
@@ -154,7 +152,6 @@
 #define VMCS_IDT_VECTORING_ERR               0x440A
 #define VMCS_EXIT_INSTR_LEN                  0x440C
 #define VMCS_EXIT_INSTR_INFO                 0x440E
-// Natural width
 #define VMCS_CR0_GUEST_HOST_MASK             0x6000
 #define VMCS_CR4_GUEST_HOST_MASK             0x6002
 #define VMCS_CR0_READ_SHADOW                 0x6004
@@ -201,14 +198,12 @@
 #define VMCS_HOST_RIP                        0x6C16
 
 // ============================================================================
-//  5. VMX execution controls (Intel SDM Vol 3C Tables 24-x / 25-7)
+//  5. VMX execution controls
 // ============================================================================
-// Pin-based
 #define PIN_BASED_EXT_INTR_EXITING       (1U << 0)
 #define PIN_BASED_NMI_EXITING            (1U << 3)
 #define PIN_BASED_VIRTUAL_NMIS           (1U << 5)
 #define PIN_BASED_PREEMPT_TIMER          (1U << 6)
-// Primary processor-based
 #define CPU_BASED_HLT_EXITING            (1U <<  7)
 #define CPU_BASED_INVLPG_EXITING         (1U <<  9)
 #define CPU_BASED_MWAIT_EXITING          (1U << 10)
@@ -222,7 +217,6 @@
 #define CPU_BASED_MONITOR_TRAP_FLAG      (1U << 27)
 #define CPU_BASED_USE_MSR_BITMAPS        (1U << 28)
 #define CPU_BASED_ACTIVATE_SECONDARY     (1U << 31)
-// Secondary processor-based
 #define CPU_BASED2_VIRTUALIZE_APIC       (1U <<  0)
 #define CPU_BASED2_ENABLE_EPT            (1U <<  1)
 #define CPU_BASED2_DESCRIPTOR_TABLE_EXIT (1U <<  2)
@@ -231,7 +225,6 @@
 #define CPU_BASED2_WBINVD_EXITING        (1U <<  6)
 #define CPU_BASED2_UNRESTRICTED_GUEST    (1U <<  7)
 #define CPU_BASED2_MODE_BASED_EPT_EXEC   (1U << 22)
-// Exit controls
 #define VM_EXIT_SAVE_DBG_CTLS            (1U <<  2)
 #define VM_EXIT_HOST_ADDR_SPACE_SIZE     (1U <<  9)
 #define VM_EXIT_ACK_INTR_ON_EXIT         (1U << 15)
@@ -239,7 +232,6 @@
 #define VM_EXIT_LOAD_IA32_PAT            (1U << 19)
 #define VM_EXIT_SAVE_IA32_EFER           (1U << 20)
 #define VM_EXIT_LOAD_IA32_EFER           (1U << 21)
-// Entry controls
 #define VM_ENTRY_IA32E_MODE              (1U <<  9)
 #define VM_ENTRY_LOAD_IA32_PAT           (1U << 14)
 #define VM_ENTRY_LOAD_IA32_EFER          (1U << 15)
@@ -286,7 +278,6 @@
 // ============================================================================
 //  7. AMD SVM intercepts, exit codes, VMCB layout constants
 // ============================================================================
-// Intercept bits in VMCB control area at offset 0x000 (CR reads/writes, misc)
 #define SVM_INTERCEPT_CR0_READ           (1U <<  0)
 #define SVM_INTERCEPT_CR1_READ           (1U <<  1)
 #define SVM_INTERCEPT_CR2_READ           (1U <<  2)
@@ -320,7 +311,6 @@
 #define SVM_INTERCEPT_CR14_WRITE         (1U << 30)
 #define SVM_INTERCEPT_CR15_WRITE         (1U << 31)
 
-// VMCB offset 0x004 - misc intercepts
 #define SVM_INTERCEPT_INTR               (1U <<  0)
 #define SVM_INTERCEPT_NMI                (1U <<  1)
 #define SVM_INTERCEPT_SMI                (1U <<  2)
@@ -354,7 +344,6 @@
 #define SVM_INTERCEPT_FERR_FREEZE        (1U << 30)
 #define SVM_INTERCEPT_SHUTDOWN           (1U << 31)
 
-// VMCB offset 0x008 - misc intercepts 2
 #define SVM_INTERCEPT_VMRUN              (1ULL <<  0)
 #define SVM_INTERCEPT_VMMCALL            (1ULL <<  1)
 #define SVM_INTERCEPT_VMLOAD             (1ULL <<  2)
@@ -370,66 +359,26 @@
 #define SVM_INTERCEPT_MWAIT_ARMED        (1ULL << 12)
 #define SVM_INTERCEPT_XSETBV             (1ULL << 13)
 
-// VMCB control offsets
-#define VMCB_CTRL_INTERCEPT_VECTOR      0x000
-#define VMCB_CTRL_INTERCEPT_MISC        0x004
-#define VMCB_CTRL_INTERCEPT_MISC2       0x008
-#define VMCB_CTRL_PAUSE_FILTER          0x00C
-#define VMCB_CTRL_IOPM_BASE             0x010
-#define VMCB_CTRL_MSRPM_BASE            0x018
-#define VMCB_CTRL_TSC_OFFSET            0x020
-#define VMCB_CTRL_ASID                  0x030
-#define VMCB_CTRL_TLB_CTL               0x038
-#define VMCB_CTRL_VTLB_CTL              0x040
-#define VMCB_CTRL_NESTED_CTL            0x048
-#define VMCB_CTRL_NESTED_CR3            0x050
-#define VMCB_CTRL_INTR_SHADOW           0x058
-#define VMCB_CTRL_EXIT_CODE             0x070
-#define VMCB_CTRL_EXIT_INFO1            0x078
-#define VMCB_CTRL_EXIT_INFO2            0x080
-#define VMCB_CTRL_EXIT_INT_INFO         0x088
-#define VMCB_CTRL_NP_ENABLE             0x090
-#define VMCB_CTRL_EVENTINJ              0x0A8
-#define VMCB_CTRL_NCR3                  0x0B0
-#define VMCB_CTRL_LBR_VIRT              0x0B8
-#define VMCB_CTRL_VMCB_CLEAN            0x0C0
-#define VMCB_CTRL_NRIP                  0x0C8
-#define VMCB_CTRL_NINST_RET             0x0D0
+#define VMCB_CTRL_INTERCEPT_CR_READ      0x000
+#define VMCB_CTRL_INTERCEPT_CR_WRITE     0x004
+#define VMCB_CTRL_INTERCEPT_EXCEPTIONS   0x008
+#define VMCB_CTRL_INTERCEPT_MISC1        0x00C
+#define VMCB_CTRL_INTERCEPT_MISC2        0x010
+#define VMCB_CTRL_IOPM_BASE              0x040
+#define VMCB_CTRL_MSRPM_BASE             0x048
+#define VMCB_CTRL_TSC_OFFSET             0x050
+#define VMCB_CTRL_ASID                   0x058
+#define VMCB_CTRL_EXIT_CODE              0x070
+#define VMCB_CTRL_EXIT_INFO1             0x078
+#define VMCB_CTRL_EXIT_INFO2             0x080
+#define VMCB_CTRL_EXIT_INT_INFO          0x088
+#define VMCB_CTRL_TLB_CTL                0x090
+#define VMCB_CTRL_EVENTINJ               0x0A8
+#define VMCB_CTRL_NESTED_CTL             0x0B0
+#define VMCB_CTRL_NESTED_CR3             0x0B8
+#define VMCB_CTRL_VMCB_CLEAN             0x0C0
+#define VMCB_CTRL_NRIP                   0x0C8
 
-// VMCB save-state offsets (AMD APM Volume 2 Appendix B)
-#define VMCB_SAVE_ES_SEL                0x400
-#define VMCB_SAVE_CS_SEL                0x410
-#define VMCB_SAVE_SS_SEL                0x420
-#define VMCB_SAVE_DS_SEL                0x430
-#define VMCB_SAVE_FS_SEL                0x440
-#define VMCB_SAVE_GS_SEL                0x450
-#define VMCB_SAVE_GDTR_SEL              0x460
-#define VMCB_SAVE_LDTR_SEL              0x470
-#define VMCB_SAVE_IDTR_SEL              0x480
-#define VMCB_SAVE_TR_SEL                0x490
-#define VMCB_SAVE_CPL                   (VMCB_SAVE_CS_SEL + 0xBB)
-#define VMCB_SAVE_EFER                  0x4D0
-#define VMCB_SAVE_CR4                   0x548
-#define VMCB_SAVE_CR3                   0x550
-#define VMCB_SAVE_CR0                   0x558
-#define VMCB_SAVE_CR2                   0x560
-#define VMCB_SAVE_DR6                   0x568
-#define VMCB_SAVE_DR7                   0x570
-#define VMCB_SAVE_RIP                   0x578
-#define VMCB_SAVE_RSP                   0x5D0
-#define VMCB_SAVE_RFLAGS                0x5D8
-#define VMCB_SAVE_RAX                   0x5E0
-#define VMCB_SAVE_STAR                  0x5E8
-#define VMCB_SAVE_LSTAR                 0x5F0
-#define VMCB_SAVE_CSTAR                 0x5F8
-#define VMCB_SAVE_SFMASK                0x600
-#define VMCB_SAVE_KERNEL_GS_BASE        0x608
-#define VMCB_SAVE_SYSENTER_CS           0x610
-#define VMCB_SAVE_SYSENTER_ESP          0x618
-#define VMCB_SAVE_SYSENTER_EIP          0x620
-#define VMCB_SAVE_G_PAT                 0x640
-
-// AMD exit codes
 #define SVM_EXIT_READ_CR0               0x000
 #define SVM_EXIT_READ_CR2               0x002
 #define SVM_EXIT_READ_CR3               0x003
@@ -468,7 +417,7 @@
 #define SVM_EXIT_AVIC_NOACCEL           0x402
 
 // ============================================================================
-//  8. EPT / NPT permissions
+//  8. EPT / NPT permissions and index extraction
 // ============================================================================
 #define EPT_PERM_READ                   (1ULL << 0)
 #define EPT_PERM_WRITE                  (1ULL << 1)
@@ -481,8 +430,10 @@
 
 #define NPT_PERM_READ                   (1ULL << 0)
 #define NPT_PERM_WRITE                  (1ULL << 1)
-#define NPT_PERM_EXECUTE                (1ULL << 2)
-#define NPT_PERM_RWX                    (NPT_PERM_READ | NPT_PERM_WRITE | NPT_PERM_EXECUTE)
+#define NPT_PERM_USER                   (1ULL << 2)
+#define NPT_PERM_EXECUTE                (0ULL)
+#define NPT_PERM_NX                     (1ULL << 63)
+#define NPT_PERM_RWX                    (NPT_PERM_READ | NPT_PERM_WRITE | NPT_PERM_USER)
 
 #define EPT_PML4_INDEX(gpa)             (((gpa) >> 39) & 0x1FFULL)
 #define EPT_PDPT_INDEX(gpa)             (((gpa) >> 30) & 0x1FFULL)
@@ -490,28 +441,174 @@
 #define EPT_PT_INDEX(gpa)               (((gpa) >> 12) & 0x1FFULL)
 
 // ============================================================================
-//  9. Hardware structures
+//  9. Vendor-specific hardware page-table entries
 // ============================================================================
-#pragma pack(push, 1)
-typedef union _EPT_ENTRY {
+typedef union _EPT_PTE {
     UINT64 Value;
     struct {
-        UINT64 Read        : 1;
-        UINT64 Write       : 1;
-        UINT64 Execute     : 1;
-        UINT64 MemType     : 3;
-        UINT64 IgnorePat   : 1;
-        UINT64 LargePage   : 1;
-        UINT64 Accessed    : 1;
-        UINT64 Dirty       : 1;
-        UINT64 UserExec    : 1;
-        UINT64 Reserved0   : 1;
-        UINT64 PhysAddr    : 40;
-        UINT64 Reserved1   : 11;
-        UINT64 SuppressVe  : 1;
-    } Fields;
-} EPT_ENTRY, *PEPT_ENTRY;
+        UINT64 Read         : 1;
+        UINT64 Write        : 1;
+        UINT64 Execute      : 1;
+        UINT64 MemoryType   : 3;
+        UINT64 IgnorePat    : 1;
+        UINT64 LargePage    : 1;
+        UINT64 Accessed     : 1;
+        UINT64 Dirty        : 1;
+        UINT64 UserExecute  : 1;
+        UINT64 Reserved0    : 1;
+        UINT64 PhysAddr     : 40;
+        UINT64 Reserved1    : 11;
+        UINT64 SuppressVe   : 1;
+    } Bits;
+} EPT_PTE, *PEPT_PTE;
 
+typedef union _NPT_PTE {
+    UINT64 Value;
+    struct {
+        UINT64 Present      : 1;
+        UINT64 Write        : 1;
+        UINT64 User         : 1;
+        UINT64 Pwt          : 1;
+        UINT64 Pcd          : 1;
+        UINT64 Accessed     : 1;
+        UINT64 Dirty        : 1;
+        UINT64 LargePage    : 1;
+        UINT64 Global       : 1;
+        UINT64 Available    : 3;
+        UINT64 PhysAddr     : 40;
+        UINT64 Reserved     : 11;
+        UINT64 Nx           : 1;
+    } Bits;
+} NPT_PTE, *PNPT_PTE;
+
+// ============================================================================
+//  10. VMCB - AMD APM Vol 2 layout, packed and offset-guarded
+// ============================================================================
+#pragma pack(push, 1)
+
+typedef struct _VMCB_SEGMENT {
+    UINT16 Selector;
+    UINT16 Attributes;
+    UINT32 Limit;
+    UINT64 Base;
+} VMCB_SEGMENT, *PVMCB_SEGMENT;
+
+typedef struct _VMCB_CONTROL_AREA {
+    UINT32 InterceptCrRead;
+    UINT32 InterceptCrWrite;
+    UINT32 InterceptExceptions;
+    UINT32 InterceptMisc1;
+    UINT32 InterceptMisc2;
+    UINT8  Reserved0[0x040 - 0x014];
+    UINT64 IopmBasePa;
+    UINT64 MsrpmBasePa;
+    UINT64 TscOffset;
+    UINT32 Asid;
+    UINT8  Reserved1[0x070 - 0x05C];
+    UINT64 ExitCode;
+    UINT64 ExitInfo1;
+    UINT64 ExitInfo2;
+    UINT64 ExitIntInfo;
+    UINT64 TlbCtl;
+    UINT8  Reserved2[0x0A8 - 0x098];
+    UINT64 EventInj;
+    UINT64 NestedCtl;
+    UINT64 NestedCr3;
+    UINT64 VmcbCleanBits;
+    UINT64 Nrip;
+    UINT8  Reserved3[0x400 - 0x0D0];
+} VMCB_CONTROL_AREA, *PVMCB_CONTROL_AREA;
+
+typedef struct _VMCB_SAVE_AREA {
+    VMCB_SEGMENT Es;
+    VMCB_SEGMENT Cs;
+    VMCB_SEGMENT Ss;
+    VMCB_SEGMENT Ds;
+    VMCB_SEGMENT Fs;
+    VMCB_SEGMENT Gs;
+    VMCB_SEGMENT Gdtr;
+    VMCB_SEGMENT Ldtr;
+    VMCB_SEGMENT Idtr;
+    VMCB_SEGMENT Tr;
+    UINT8  Reserved0[0xCB - 0xA0];
+    UINT8  Cpl;
+    UINT8  Reserved1[0x04];
+    UINT64 Efer;
+    UINT8  Reserved2[0x148 - 0xD8];
+    UINT64 Cr4;
+    UINT64 Cr3;
+    UINT64 Cr0;
+    UINT64 Dr7;
+    UINT64 Dr6;
+    UINT64 Rflags;
+    UINT64 Rip;
+    UINT8  Reserved3[0x1D8 - 0x180];
+    UINT64 Rsp;
+    UINT8  Reserved4[0x1F8 - 0x1E0];
+    UINT64 Rax;
+    UINT8  Reserved5[0x268 - 0x200];
+    UINT64 GPat;
+    UINT8  Reserved6[0xC00 - 0x270];
+} VMCB_SAVE_AREA, *PVMCB_SAVE_AREA;
+
+typedef struct _VMCB {
+    VMCB_CONTROL_AREA Control;
+    VMCB_SAVE_AREA    Save;
+} VMCB, *PVMCB;
+
+#pragma pack(pop)
+
+static_assert(sizeof(VMCB_SEGMENT) == 0x10, "VMCB segment size mismatch");
+static_assert(sizeof(VMCB_CONTROL_AREA) == 0x400, "VMCB control area size mismatch");
+static_assert(sizeof(VMCB_SAVE_AREA) == 0xC00, "VMCB save area size mismatch");
+static_assert(sizeof(VMCB) == 0x1000, "VMCB size mismatch");
+
+static_assert(offsetof(VMCB, Control.InterceptCrRead) == 0x000, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.InterceptCrWrite) == 0x004, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.InterceptExceptions) == 0x008, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.InterceptMisc1) == 0x00C, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.InterceptMisc2) == 0x010, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.IopmBasePa) == 0x040, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.MsrpmBasePa) == 0x048, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.Asid) == 0x058, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.ExitCode) == 0x070, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.ExitInfo1) == 0x078, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.ExitInfo2) == 0x080, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.ExitIntInfo) == 0x088, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.TlbCtl) == 0x090, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.EventInj) == 0x0A8, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.NestedCtl) == 0x0B0, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.NestedCr3) == 0x0B8, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.VmcbCleanBits) == 0x0C0, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Control.Nrip) == 0x0C8, "VMCB offset mismatch");
+
+static_assert(offsetof(VMCB, Save.Es) == 0x400, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Cs) == 0x410, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Ss) == 0x420, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Ds) == 0x430, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Fs) == 0x440, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Gs) == 0x450, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Gdtr) == 0x460, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Ldtr) == 0x470, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Idtr) == 0x480, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Tr) == 0x490, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Cpl) == 0x4CB, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Efer) == 0x4D0, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Cr4) == 0x548, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Cr3) == 0x550, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Cr0) == 0x558, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Dr7) == 0x560, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Dr6) == 0x568, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Rflags) == 0x570, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Rip) == 0x578, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Rsp) == 0x5D8, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.Rax) == 0x5F8, "VMCB offset mismatch");
+static_assert(offsetof(VMCB, Save.GPat) == 0x668, "VMCB offset mismatch");
+
+// ============================================================================
+//  11. Descriptor tables and segment access rights
+// ============================================================================
+#pragma pack(push, 1)
 typedef struct _DESCRIPTOR_TABLE_REGISTER64 {
     UINT16 Limit;
     UINT64 Base;
@@ -529,7 +626,6 @@ typedef struct _SEGMENT_DESCRIPTOR64 {
 } SEGMENT_DESCRIPTOR64, *PSEGMENT_DESCRIPTOR64;
 #pragma pack(pop)
 
-// Segment access-rights byte format (VMCS AR field)
 #define AR_PRESENT                      (1U << 7)
 #define AR_DPL(x)                       (((x) & 3) << 5)
 #define AR_S                            (1U << 4)
@@ -537,16 +633,13 @@ typedef struct _SEGMENT_DESCRIPTOR64 {
 #define AR_UNUSABLE                     (1U << 16)
 
 // ============================================================================
-//  10. Dynamic identity-map range
+//  12. Identity-map ranges and physical page-table pool
 // ============================================================================
 typedef struct _HV_IDENTITY_RANGE {
     UINT64 Base;
     UINT64 Size;
 } HV_IDENTITY_RANGE, *PHV_IDENTITY_RANGE;
 
-// ============================================================================
-//  11. Pre-allocated 4 KB page table pool
-// ============================================================================
 #define HV_PT_POOL_MAX_PAGES            4096
 #define HV_PT_POOL_GUARD_QWORDS         8
 #define HV_PT_POOL_GUARD_COOKIE         0x48565054504F4F4CULL
@@ -574,8 +667,17 @@ static __forceinline BOOLEAN HvPtPoolValidate(PHV_PT_POOL Pool)
            (Pool->GuardCookie == HV_PT_POOL_GUARD_COOKIE);
 }
 
+typedef struct __declspec(align(64)) _HV_PHYS_MAP_TRACKER {
+    volatile LONG64 Generation;
+    volatile LONG64 ActiveMappings;
+    volatile LONG   Lock;
+    UINT64          EptRootPa;
+    UINT64          NptRootPa;
+    UINT64          Reserved[4];
+} HV_PHYS_MAP_TRACKER, *PHV_PHYS_MAP_TRACKER;
+
 // ============================================================================
-//  12. Protected range (anti-cheat policy)
+//  13. Protected range (anti-cheat policy)
 // ============================================================================
 #define MAX_PROTECTED_RANGES            32
 
@@ -587,7 +689,7 @@ typedef struct _PROTECTED_RANGE {
 } PROTECTED_RANGE, *PPROTECTED_RANGE;
 
 // ============================================================================
-//  13. Per-CPU context (vendor-agnostic layout)
+//  14. Per-CPU context
 // ============================================================================
 #define VMX_HOST_STACK_SIZE             (64 * 1024)
 #define HV_CPU_STATE_FENCE()            _ReadWriteBarrier()
@@ -595,7 +697,6 @@ typedef struct _PROTECTED_RANGE {
 typedef struct __declspec(align(64)) _PER_CPU_CONTEXT {
     ULONG   CpuIndex;
 
-    // Intel
     PVOID   VmxonVa;
     UINT64  VmxonPa;
     PVOID   VmcsVa;
@@ -603,27 +704,26 @@ typedef struct __declspec(align(64)) _PER_CPU_CONTEXT {
     PVOID   MsrBitmapVa;
     UINT64  MsrBitmapPa;
 
-    // AMD
     PVOID   VmcbVa;
     UINT64  VmcbPa;
     PVOID   HostSaveVa;
     UINT64  HostSavePa;
 
-    // Common
     PVOID   HostStack;
     UINT64  HostStackTop;
-    volatile BOOLEAN Launched;
 
-    // Single-step pending state (MTF on Intel / RFLAGS.TF on AMD)
-    volatile BOOLEAN SingleStepPending;
-    volatile UINT64  PendingGpa;
-    volatile UINT64  PendingOrigVal;
+    volatile LONG      ProcessorState;
+    volatile LONG64    ExitCount;
+    volatile BOOLEAN   Launched;
+    volatile BOOLEAN   SingleStepPending;
+    volatile UINT64    PendingGpa;
+    volatile UINT64    PendingOrigVal;
 
     UINT64  Reserved[4];
 } PER_CPU_CONTEXT, *PPER_CPU_CONTEXT;
 
 // ============================================================================
-//  14. Abstract runtime interface - vendor dispatch
+//  15. Abstract runtime interface - vendor dispatch
 // ============================================================================
 typedef enum _HV_VENDOR {
     HvVendorUnknown = 0,
@@ -635,30 +735,25 @@ typedef struct _HV_OPERATIONS {
     HV_VENDOR    Vendor;
     const char*  Name;
 
-    // Lifecycle
     NTSTATUS (*Initialize)(VOID);
     VOID     (*Teardown)(VOID);
 
-    // Memory protection
     NTSTATUS (*BuildIdentityMap)(const HV_IDENTITY_RANGE* Ranges, ULONG Count);
     NTSTATUS (*ProtectRange)(UINT64 Gpa, UINT64 Size, UINT64 Perms);
     NTSTATUS (*SaveAndGrant)(UINT64 Gpa, UINT64 Perms, UINT64* OutOriginal);
     NTSTATUS (*RestoreEntry)(UINT64 Gpa, UINT64 OriginalValue);
-    NTSTATUS (*SplitAndGetPte)(UINT64 Gpa, PEPT_ENTRY* OutPte);
+    NTSTATUS (*SplitAndGetPte)(UINT64 Gpa, UINT64* OutPteValue);
 
-    // Single-step (MTF on Intel, RFLAGS.TF on AMD)
     VOID     (*ArmSingleStep)(PPER_CPU_CONTEXT Cpu);
     VOID     (*DisarmSingleStep)(PPER_CPU_CONTEXT Cpu);
 
-    // Exception injection
     NTSTATUS (*InjectException)(UINT32 Vector, UINT32 ErrorCode, UINT64 FaultingGpa);
 
-    // TLB maintenance
     VOID     (*InvalidateTlbAll)(VOID);
 } HV_OPERATIONS, *PHV_OPERATIONS;
 
 // ============================================================================
-//  15. Cross-module globals
+//  16. Cross-module globals
 // ============================================================================
 extern HV_PT_POOL       g_PtPool;
 extern PER_CPU_CONTEXT* g_PerCpu;
@@ -670,10 +765,8 @@ extern HV_IDENTITY_RANGE* g_IdentityRanges;
 extern ULONG            g_IdentityRangeCount;
 
 // ============================================================================
-//  16. Inline helpers
+//  17. Inline helpers
 // ============================================================================
-
-// Any-IRQL spinlock safe inside VM-exit context.
 static __forceinline void SpinAcquire(volatile LONG* Lock)
 {
     while (_InterlockedCompareExchange(Lock, 1, 0) != 0)
@@ -687,9 +780,6 @@ static __forceinline void SpinRelease(volatile LONG* Lock)
     _InterlockedExchange(Lock, 0);
 }
 
-// VMCS accessors evaluate the architectural status byte returned by the
-// compiler intrinsics. A non-zero status is a programming or hardware
-// interface failure and is asserted in debug builds.
 #define HV_VMX_STATUS_ASSERT(Status) NT_ASSERT((Status) == 0)
 
 static __forceinline unsigned char VmRead64Status(UINT64 Field, UINT64* Value)
@@ -772,8 +862,6 @@ static __forceinline void VmWrite16(UINT64 Field, UINT16 Value)
     (void)VmWrite16Status(Field, Value);
 }
 
-// VmxAdjustControls applies Intel SDM Vol 3C App. B capability semantics:
-// bits[31:0] are the must-be-1 mask and bits[63:32] are the must-be-0 mask.
 static __forceinline void VmxAdjustControls(UINT32* Ctl, UINT32 Msr)
 {
     UINT64 caps = __readmsr(Msr);
@@ -781,8 +869,6 @@ static __forceinline void VmxAdjustControls(UINT32* Ctl, UINT32 Msr)
     *Ctl &=  (UINT32)((caps >> 32) & 0xFFFFFFFF);
 }
 
-// Vendor detection. The MSVC x64 __cpuid array layout is:
-//   r[0] = EAX, r[1] = EBX, r[2] = ECX, r[3] = EDX.
 static __forceinline HV_VENDOR HvDetectVendor(VOID)
 {
     int regs[4] = { 0 };
@@ -792,7 +878,6 @@ static __forceinline HV_VENDOR HvDetectVendor(VOID)
     UINT32 ecx = (UINT32)regs[2];
     UINT32 edx = (UINT32)regs[3];
 
-    // "GenuineIntel": EBX="Genu", ECX="ntel", EDX="ineI"
     if (ebx == 0x756E6547 &&
         ecx == 0x6C65746E &&
         edx == 0x49656E69)
@@ -800,7 +885,6 @@ static __forceinline HV_VENDOR HvDetectVendor(VOID)
         return HvVendorIntel;
     }
 
-    // "AuthenticAMD": EBX="Auth", ECX="cAMD", EDX="enti"
     if (ebx == 0x68747541 &&
         ecx == 0x444D4163 &&
         edx == 0x69746E65)
@@ -812,30 +896,23 @@ static __forceinline HV_VENDOR HvDetectVendor(VOID)
 }
 
 // ============================================================================
-//  17. Cross-module API declarations
+//  18. Cross-module API declarations
 // ============================================================================
-
-// ept_common.cpp - page-table pool
 NTSTATUS HvPtPoolInit(VOID);
 VOID     HvPtPoolDestroy(VOID);
 PVOID    HvPtPoolAlloc(UINT64* OutPhys);
 VOID     HvPtPoolFree(PVOID Page);
 
-// ept_common.cpp - identity ranges
 NTSTATUS HvCollectPhysicalRanges(PHV_IDENTITY_RANGE* OutRanges, PULONG OutCount);
 VOID     HvFreePhysicalRanges(HV_IDENTITY_RANGE* Ranges);
 
-// ept_common.cpp - exception injection
 NTSTATUS HvInjectGuestPageFault(UINT64 Gpa, BOOLEAN Write, BOOLEAN Execute);
 
-// vmm.cpp
 PPER_CPU_CONTEXT GetCurrentCpu(VOID);
 
-// vmexit.cpp - called from asm stub
 extern "C" void VmxVmExitHandlerC(UINT64* GuestRegs);
 extern "C" void SvmVmExitHandlerC(UINT64* GuestRegs);
 
-// asm stubs
 extern "C" {
     UINT16 VmxReadTr(VOID);
     UINT8  VmxLaunch(VOID);
