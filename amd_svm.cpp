@@ -1,15 +1,11 @@
 // ============================================================================
 //  amd_svm.cpp — AMD-V (SVM) core execution module: VMCB lifecycle, per-CPU
-//  bring-up, VMRUN launch, and teardown.
+//  bring-up, VMRUN launch, single-step NPT entry maintenance, and teardown.
 //
 //  Architectural reference: AMD64 Architecture Programmer's Manual Volume 2,
 //  Chapter 15 (SVM) and Appendix B (VMCB layout).
 //
-//  Nested Page Table operations live in amd_npt.cpp; this module binds the
-//  vendor-agnostic operations template to those exports and drives the VMCB
-//  lifecycle around them.
-//
-//  SVM lifecycle mechanics implemented here:
+//  Engine mechanics implemented here:
 //
 //    SETUP   A 4KB physically contiguous Host Save Area (HSAVE) is allocated
 //            per logical processor and registered in MSR_VM_HSAVE_PA. VMRUN
@@ -26,48 +22,79 @@
 //            intercept (bit 32 of the 64-bit intercept field, exposed here
 //            as InterceptMisc2 bit 0) or an invalid HSAVE pointer.
 //
+//    TLB     TLB_CONTROL (VMCB 0x05C) is a per-VMRUN flush ORDER, not a
+//            sticky configuration: encoding 01b orders the next VMRUN to
+//            purge the entire TLB, and the order is consumed by that single
+//            entry. The order is therefore armed exactly once during VMCB
+//            initialization and re-armed only by explicit NPT invalidations;
+//            every host-side exit callback parks the field back at 00b so
+//            steady-state VMRUN iterations reuse tagged TLB entries instead
+//            of forcing a full hardware TLB rebuild per iteration.
+//
 //    EXIT    #VMEXIT stores guest architectural state into the VMCB save
 //            area; the host resumes at RIP+13 of the VMRUN with its own
 //            state restored from the HSAVE area by microcode.
 //
-//    TEARDOWN  SVME is cleared so no further VMRUN can execute; all guest
-//            context survives in the VMCB save area. VMSAVE/CLGI belong to
-//            the assembler primitives layer only — executing VMSAVE from a
-//            host-mode C routine would overwrite VMCB FS/GS/TR/LDTR state
-//            with live host values and destroy guest state.
+//    TEARDOWN  SVME is cleared so no further VMRUN can execute. VMSAVE and
+//            CLGI belong exclusively to the assembler primitives layer:
+//            executing VMSAVE from a host-mode C routine would overwrite
+//            the VMCB FS/GS/TR/LDTR (and STAR/LSTAR) save fields with live
+//            host values and destroy guest state. Teardown instead captures
+//            the guest RIP/RSP/RAX from the VMCB save area, publishes them
+//            into the naked stub's register block, and lets the stub perform
+//            a native long-mode jump back into guest execution — no SVM
+//            instruction ever touches the save area on this path.
+//
+//  Nested Page Table construction lives in amd_npt.cpp; the single-step
+//  entry-maintenance callbacks (save / relax / restore) live here because
+//  they are bound to the per-core PCPU_CONTEXT tracking block.
 // ============================================================================
 #include "common.h"
 #include <stddef.h>
 #include <intrin.h>
 
 // ----------------------------------------------------------------------------
-//  Forward declarations of the core lifecycle routines implemented here.
+//  Forward declarations of the lifecycle routines implemented in this TU.
 // ----------------------------------------------------------------------------
 static NTSTATUS SvmInitialize(VOID);
 static VOID     SvmTeardown(VOID);
-static VOID     SvmArmSingleStep(PPER_CPU_CONTEXT Cpu);
-static VOID     SvmDisarmSingleStep(PPER_CPU_CONTEXT Cpu);
-static NTSTATUS SvmInjectException(UINT32 Vector, UINT32 ErrorCode, UINT64 FaultingGpa);
+static VOID     SvmArmSingleStep(PPCPU_CONTEXT Cpu);
+static VOID     SvmDisarmSingleStep(PPCPU_CONTEXT Cpu);
+static NTSTATUS SvmInjectException(PPCPU_CONTEXT Cpu, UINT32 Vector, UINT32 ErrorCode, UINT64 FaultingGpa);
+static NTSTATUS SvmSaveEntry(PPCPU_CONTEXT Cpu, UINT64 Gpa);
+static NTSTATUS SvmRelaxPermissions(PPCPU_CONTEXT Cpu, UINT64 Gpa, UINT64 Perms);
+static NTSTATUS SvmRestoreEntry(PPCPU_CONTEXT Cpu);
 
 // ----------------------------------------------------------------------------
-//  NPT operations — implemented in amd_npt.cpp. The memory-protection half
-//  of the operations template dispatches straight into that module; this TU
-//  owns only the execution lifecycle.
+//  NPT construction exports — implemented in amd_npt.cpp. Page-table build,
+//  permission restriction and pool management dispatch into that module; this
+//  TU owns the execution lifecycle and the per-core single-step entry edits.
 // ----------------------------------------------------------------------------
 extern "C" {
     NTSTATUS SvmBuildIdentityMap(const HV_IDENTITY_RANGE* Ranges, ULONG Count);
     NTSTATUS SvmProtectRange(UINT64 Gpa, UINT64 Size, UINT64 Perms);
-    NTSTATUS SvmSaveAndGrant(UINT64 Gpa, UINT64 Perms, UINT64* OutOriginal);
-    NTSTATUS SvmRestoreEntry(UINT64 Gpa, UINT64 OriginalValue);
-    NTSTATUS SvmSplitAndGetPte(UINT64 Gpa, PEPT_ENTRY* OutPte);
-    VOID     SvmInvalidateTlbAll(VOID);
     VOID     NptFreeAll(VOID);
     UINT64   NptGetPml4Phys(VOID);
     BOOLEAN  NptIsReady(VOID);
 }
 
 // ----------------------------------------------------------------------------
-//  Exported operations table.
+//  Dynamic address resolver — implemented in ept_common.cpp. Converts a
+//  physical page backing the shared page-table pool into its mapped virtual
+//  address, allowing NPT levels to be walked without maintaining parallel
+//  virtual arrays.
+// ----------------------------------------------------------------------------
+extern "C" PVOID HvPtPoolVaFromPa(UINT64 PhysicalAddress);
+
+// ----------------------------------------------------------------------------
+//  Assembler-layer primitives. VmxReadTr reads the TR selector through the
+//  vendor-neutral stub; SvmLaunch is the naked VMRUN primitive that never
+//  "returns" on the success path (it long-jumps away into guest execution).
+// ----------------------------------------------------------------------------
+extern "C" UINT16 VmxReadTr(VOID);
+
+// ----------------------------------------------------------------------------
+//  Exported operations table — bound to the unified template in common.h.
 // ----------------------------------------------------------------------------
 HV_OPERATIONS g_AmdOps = {
     HvVendorAmd,
@@ -76,26 +103,38 @@ HV_OPERATIONS g_AmdOps = {
     SvmTeardown,
     SvmBuildIdentityMap,
     SvmProtectRange,
-    SvmSaveAndGrant,
+    SvmSaveEntry,
+    SvmRelaxPermissions,
     SvmRestoreEntry,
-    SvmSplitAndGetPte,
     SvmArmSingleStep,
     SvmDisarmSingleStep,
     SvmInjectException,
     SvmInvalidateTlbAll,
 };
 
-// ----------------------------------------------------------------------------
+// ============================================================================
 //  SVM constants.
-// ----------------------------------------------------------------------------
+// ============================================================================
+
+#ifndef SVM_GUEST_ASID
 #define SVM_GUEST_ASID          1U
+#endif
 
 // NP_ENABLE (VMCB control offset 0x090): bit 0 enables nested paging; n_cr3
 // at offset 0x0B0 carries the NPT PML4 physical base.
+#ifndef SVM_NPT_ENABLE
 #define SVM_NPT_ENABLE          1ULL
+#endif
 
 // Exception-intercept bitmap (VMCB offset 0x008): bit N traps vector N.
+#ifndef SVM_INTERCEPT_DB
 #define SVM_INTERCEPT_DB        (1U << 1)
+#endif
+
+// #PF (vector 14) is deliberately NEVER armed — see SvmInitializeVmcb.
+#ifndef SVM_INTERCEPT_PF
+#define SVM_INTERCEPT_PF        (1U << 14)
+#endif
 
 // Misc intercept bit for VMRUN (VMCB control offset 0x010, bit 0 of the
 // upper 32-bit half of the 64-bit intercept field, i.e. bit 32 architecturally).
@@ -105,18 +144,89 @@ HV_OPERATIONS g_AmdOps = {
 #define SVM_INTERCEPT_VMRUN     (1U << 0)
 #endif
 
-// TLB_CONTROL (VMCB offset 0x05C). Encoding 01b orders the processor to
-// flush its entire TLB (all ASIDs, non-global) on the next VMRUN, purging
-// stale guest TLB tags left by any prior SVM state on the core.
-#define SVM_TLBCTL_FLUSH_ALL    0x01
+// TLB_CONTROL (VMCB offset 0x05C) encodings.
+//   00b — do not flush: steady-state order for every standard VMRUN.
+//   01b — flush the entire TLB (all ASIDs, non-global): one-shot purge armed
+//         at VMCB initialization and re-armed only by NPT invalidations.
+#ifndef SVM_TLBCTL_FLUSH_NOTHING
+#define SVM_TLBCTL_FLUSH_NOTHING    0x00
+#endif
+#ifndef SVM_TLBCTL_FLUSH_ALL
+#define SVM_TLBCTL_FLUSH_ALL        0x01
+#endif
 
 // MSR_VM_CR (0xC0010114) bit 4: SVMDIS. When set, SVM is disabled by
 // platform firmware and cannot be re-enabled by software.
+#ifndef SVM_VM_CR_SVMDIS
 #define SVM_VM_CR_SVMDIS        (1ULL << 4)
+#endif
 
 // Guest PAT is seeded from the host PAT so guest page-attribute encodings
 // resolve to the same caching policies the NPT leaves assume.
+#ifndef MSR_IA32_PAT
 #define MSR_IA32_PAT            0x00000277
+#endif
+
+// EVENTINJ (VMCB control offset 0x0A8) field encoding.
+#ifndef SVM_EVENTINJ_VALID
+#define SVM_EVENTINJ_VALID              (1ULL << 31)   // event consumed by next VMRUN
+#define SVM_EVENTINJ_TYPE_EXCEPTION     (3ULL << 8)    // type 3 = hardware exception
+#define SVM_EVENTINJ_ERROR_CODE_VALID   (1ULL << 11)   // EV: error code present
+#define SVM_EVENTINJ_ERROR_CODE_SHIFT   32             // error code occupies bits 63:32
+#endif
+
+// EXITINTINFO (VMCB control offset 0x088): valid bit mirrors EVENTINJ. When
+// set, an event intercepted on exit is still pending delivery to the guest.
+#ifndef SVM_EXITINTINFO_VALID
+#define SVM_EXITINTINFO_VALID   (1U << 31)
+#endif
+
+// Teardown hypercall code ('HVmx') issued through the VMMCALL channel.
+#ifndef HV_HYPERCALL_TEARDOWN
+#define HV_HYPERCALL_TEARDOWN   0x48566D78ULL
+#endif
+
+// ----------------------------------------------------------------------------
+//  GuestRegs register-block indices.
+//
+//  The naked assembly stub spills guest GPRs into a linear UINT64 block at
+//  #VMEXIT (AMD #VMEXIT does not save GPRs other than RAX/RSP/RIP/RFLAGS —
+//  those live in the VMCB save area, everything else is still live in the
+//  physical registers when the stub's first instruction executes). These
+//  indices must match the GUEST_REGS layout declared in common.h; the
+//  overrides below only fire when common.h does not define them.
+// ----------------------------------------------------------------------------
+#ifndef HV_GUEST_REG_RAX
+#define HV_GUEST_REG_RAX    0
+#endif
+#ifndef HV_GUEST_REG_RSP
+#define HV_GUEST_REG_RSP    4
+#endif
+#ifndef HV_GUEST_REG_RIP
+#define HV_GUEST_REG_RIP    17
+#endif
+
+// ----------------------------------------------------------------------------
+//  NPT leaf-PTE permission masks (AMD64 nested-paging entry format, APM Vol 2
+//  chapter 5). The typed NPT_PTE overlay from common.h is the canonical view;
+//  permission edits are expressed as mask operations on the raw quadword so
+//  the code is independent of compiler bitfield packing order.
+// ----------------------------------------------------------------------------
+#ifndef NPT_PTE_PRESENT
+#define NPT_PTE_PRESENT     (1ULL << 0)                 // P  — readable
+#define NPT_PTE_WRITE       (1ULL << 1)                 // R/W
+#define NPT_PTE_USER        (1ULL << 2)                 // U/S
+#define NPT_PTE_LARGE       (1ULL << 7)                 // PS — 2MB / 1GB leaf
+#define NPT_PTE_PFN_MASK    0x000FFFFFFFFFF000ULL       // physical frame, bits 51:12
+#define NPT_PTE_NX          (1ULL << 63)                // no-execute
+#endif
+
+// Logical permission requests accepted by SvmRelaxPermissions.
+#ifndef NPT_PERM_READ
+#define NPT_PERM_READ       0x1ULL
+#define NPT_PERM_WRITE      0x2ULL
+#define NPT_PERM_EXECUTE    0x4ULL
+#endif
 
 // ============================================================================
 //  VMCB layout definitions (AMD APM Vol 2, App. B).
@@ -344,7 +454,8 @@ static NTSTATUS SvmAuditHardwareSupport(VOID)
         return STATUS_NOT_SUPPORTED;
 
     // EDX bit 3 = Next RIP Save. The #VMEXIT NextRip field is required for
-    // clean instruction re-execution during single-stepping.
+    // clean instruction re-execution during single-stepping and for the
+    // teardown resume-RIP computation.
     if (!(regs[3] & (1 << 3)))
         return STATUS_NOT_SUPPORTED;
 
@@ -395,33 +506,22 @@ static UINT16 SvmEncodeAttrib(UINT8 Access, UINT8 FlagsByte)
 }
 
 // ----------------------------------------------------------------------------
-//  SvmSetupSegment — populate a VMCB segment save field from explicit parts.
-// ----------------------------------------------------------------------------
-static VOID SvmSetupSegment(
-    VMCB_SEG* Seg, UINT16 Selector, UINT64 Base, UINT32 Limit, UINT16 Attrib)
-{
-    Seg->Selector = Selector;
-    Seg->Attrib   = Attrib;
-    Seg->Limit    = Limit;
-    Seg->Base     = Base;
-}
-
-// ----------------------------------------------------------------------------
-//  SvmReadGdtDescriptor — decode one GDT entry into a VMCB save field.
+//  SvmSetupSegment — compliant x64 GDT decode of one selector into a VMCB
+//  segment save field.
 //
 //  Width discipline in long mode: code/data descriptors (access-byte S=1)
 //  are 8 bytes and their canonical base is fully contained in bytes 2-4 + 7;
-//  system descriptors (S=0, e.g. the 64-bit TSS backing TR) are 16 bytes and
-//  extend the base through bytes 8-11. The access byte at offset +5 is probed
-//  first so the correct width is bounds-checked against GDTR.Limit — a 16-byte
-//  read at the final GDT slot of an 8-byte-only table can never run past the
-//  table edge, and a 16-byte system descriptor sitting exactly at the edge is
-//  accepted rather than falsely dropped.
+//  system descriptors (S=0, e.g. the 64-bit TSS backing TR, or an LDT) are
+//  16 bytes and extend the base through bytes 8-11. The access byte at
+//  offset +5 is probed first so the correct width is bounds-checked against
+//  GDTR.Limit: a 16-byte read at the final GDT slot of an 8-byte-only table
+//  can never run past the table edge, and a 16-byte system descriptor
+//  sitting exactly at the edge is accepted rather than falsely dropped.
 //
 //  ExpectedS constrains the caller: 1 requires a code/data descriptor, 0
 //  requires a system descriptor (LDT/TSS/etc.).
 // ----------------------------------------------------------------------------
-static BOOLEAN SvmReadGdtDescriptor(UINT16 Selector, VMCB_SEG* Seg, UINT8 ExpectedS)
+static BOOLEAN SvmSetupSegment(VMCB_SEG* Seg, UINT16 Selector, UINT8 ExpectedS)
 {
     // Null selector: the VMCB save field carries the (zero) selector with
     // all attributes cleared, matching architectural load semantics.
@@ -469,6 +569,8 @@ static BOOLEAN SvmReadGdtDescriptor(UINT16 Selector, VMCB_SEG* Seg, UINT8 Expect
                 | ((UINT64)baseHigh << 24);
 
     if (width == 16) {
+        // 16-byte system descriptor: canonical base bits 63:32 live in the
+        // second quadword (bytes 8-11).
         UINT32 baseUpper = *(const UINT32*)(desc + 8);
         base |= ((UINT64)baseUpper << 32);
     }
@@ -486,36 +588,283 @@ static BOOLEAN SvmReadGdtDescriptor(UINT16 Selector, VMCB_SEG* Seg, UINT8 Expect
 }
 
 // ----------------------------------------------------------------------------
-//  SvmReadSegment — code/data descriptor (S=1, 8 bytes).
+//  SvmSetupTableRegister — populate a table-register save field (GDTR/IDTR/
+//  LDTR). Table registers carry base and limit only; the VMCB Attrib field
+//  is reserved for them (an explicit unusable-LDT encoding is supplied by
+//  the caller for LDTR so VMRUN consistency checks accept the save state).
 // ----------------------------------------------------------------------------
-static BOOLEAN SvmReadSegment(UINT16 Selector, VMCB_SEG* Seg)
+static VOID SvmSetupTableRegister(
+    VMCB_SEG* Seg, UINT16 Selector, UINT64 Base, UINT32 Limit, UINT16 Attrib)
 {
-    return SvmReadGdtDescriptor(Selector, Seg, 1);
+    Seg->Selector = Selector;
+    Seg->Attrib   = Attrib;
+    Seg->Limit    = Limit;
+    Seg->Base     = Base;
+}
+
+// ============================================================================
+//  TLB_CONTROL maintenance.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+//  SvmParkTlbFlushOrder — consume-side of the one-shot flush discipline.
+//
+//  TLB_CONTROL is an ORDER evaluated at VMRUN entry, not sticky hardware
+//  state: after one VMRUN executed with order 01b the full purge happened
+//  and the field has no further meaning. Every host-side exit callback that
+//  touches the VMCB therefore parks the order back at 00b before the exit
+//  dispatcher re-enters the guest, so standard VMRUN iterations never force
+//  a comprehensive hardware TLB rebuild. NPT paths that mutate a nested PTE
+//  re-arm the order explicitly for exactly one entry via SvmInvalidateTlbAll
+//  after their mutation completes.
+// ----------------------------------------------------------------------------
+static VOID SvmParkTlbFlushOrder(PPCPU_CONTEXT Cpu)
+{
+    PVMCB vmcb = (PVMCB)Cpu->VmcbVa;
+    if (!vmcb)
+        return;
+
+    vmcb->Control.TlbCtl = SVM_TLBCTL_FLUSH_NOTHING;
 }
 
 // ----------------------------------------------------------------------------
-//  SvmReadTssBase — TR points to a 16-byte system descriptor; the 64-bit TSS
-//  lives in long mode and the base is fully expressed through bytes 8-11.
-//  Type must be a TSS (9 = 64-bit available, 11 = 64-bit busy).
+//  SvmTlbFlushDpc — per-core body of the coordinated NPT flush. Runs on
+//  every logical processor via KeGenericCallDpc. Arming TLB_CONTROL=01b on a
+//  core that is currently executing guest code is architecturally safe: the
+//  control area is plain memory while VMRUN is active, the order is read at
+//  the next VMRUN entry, and that entry then performs the purge — killing
+//  every stale nested translation on the core before guest execution
+//  observes the mutated PTE.
 // ----------------------------------------------------------------------------
-static BOOLEAN SvmReadTssBase(UINT16 Selector, VMCB_SEG* Seg)
+static VOID SvmTlbFlushDpc(
+    PKDPC Dpc, PVOID DeferredContext, PVOID SystemArgument1, PVOID SystemArgument2)
 {
-    if (!SvmReadGdtDescriptor(Selector, Seg, 0))
-        return FALSE;
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(DeferredContext);
+    UNREFERENCED_PARAMETER(SystemArgument2);
 
-    UINT8 type = (UINT8)(Seg->Attrib & 0x0F);
-    if (type != 0x9 && type != 0xB)
-        return FALSE;
+    PCPU_CONTEXT cpu = GetCurrentCpu();
+    if (cpu && cpu->Launched && cpu->VmcbVa) {
+        PVMCB vmcb = (PVMCB)cpu->VmcbVa;
+        vmcb->Control.TlbCtl = SVM_TLBCTL_FLUSH_ALL;
+    }
 
-    return TRUE;
+    // KeGenericCallDpc blocks until every processor signals completion; the
+    // signal must be unconditional or the initiator deadlocks.
+    if (SystemArgument1)
+        KeSignalCallDpcDone(SystemArgument1);
 }
 
-extern "C" UINT16 VmxReadTr(VOID);
+// ----------------------------------------------------------------------------
+//  SvmInvalidateTlbAll — coordinated all-core NPT TLB invalidation.
+//
+//  Called after a nested PTE mutation (single-step relax/restore) so no core
+//  keeps servicing guest translations through the stale entry. The DPC
+//  barrier guarantees every core has re-armed its one-shot purge before this
+//  routine returns; the calling core's next VMRUN therefore runs against a
+//  fully consistent NPT view. Must be invoked at IRQL <= DISPATCH_LEVEL and
+//  never while holding g_Npt.Lock — a core spinning on that lock cannot run
+//  its DPC and the barrier would deadlock.
+// ----------------------------------------------------------------------------
+extern "C" VOID SvmInvalidateTlbAll(PPCPU_CONTEXT Cpu)
+{
+    UNREFERENCED_PARAMETER(Cpu);
+
+    if (InterlockedCompareExchange(&g_ShuttingDown, 0, 0) != 0)
+        return;
+
+    KeGenericCallDpc(SvmTlbFlushDpc, NULL);
+}
+
+// ============================================================================
+//  Per-core single-step NPT entry maintenance.
+//
+//  All temporary step state (SavedPteValue, SingleStepPageGpa) is isolated
+//  inside the local core's PCPU_CONTEXT tracking block — never in global
+//  storage — so concurrent single-stepping on different cores cannot cross-
+//  contaminate PTE snapshots.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+//  SvmLocateNptPte — 4-level NPT walk returning the address of the leaf PTE
+//  quadword that translates Gpa (APM Vol 2, chapter 5). Table pages are
+//  resolved through the dynamic pool resolver HvPtPoolVaFromPa, so no
+//  parallel virtual mirror of the NPT is required. Large-page intermediates
+//  (2MB/1GB leaves) are rejected: single-step granularity is one 4KB page
+//  and amd_npt.cpp owns the split path that must run first.
+// ----------------------------------------------------------------------------
+static NTSTATUS SvmLocateNptPte(UINT64 Gpa, volatile UINT64** PteOut)
+{
+    if (!PteOut)
+        return STATUS_INVALID_PARAMETER;
+
+    *PteOut = NULL;
+
+    UINT64 tablePa = NptGetPml4Phys();
+    if (!tablePa)
+        return STATUS_UNSUCCESSFUL;
+
+    static const ULONG levelShift[3] = { 39, 30, 21 };
+
+    // PML4 -> PDPT -> PD: descend through non-leaf entries.
+    for (ULONG level = 0; level < 3; level++) {
+        PVOID tableVa = HvPtPoolVaFromPa(tablePa);
+        if (!tableVa)
+            return STATUS_UNSUCCESSFUL;
+
+        volatile UINT64* entry =
+            (volatile UINT64*)tableVa + ((Gpa >> levelShift[level]) & 0x1FF);
+
+        UINT64 value = *entry;
+        if (!(value & NPT_PTE_PRESENT))
+            return STATUS_NOT_FOUND;
+
+        // PDPT bit 7 = 1GB leaf, PD bit 7 = 2MB leaf. PML4 bit 7 is
+        // reserved and intentionally not checked.
+        if (level >= 1 && (value & NPT_PTE_LARGE))
+            return STATUS_NOT_SUPPORTED;
+
+        tablePa = value & NPT_PTE_PFN_MASK;
+    }
+
+    PVOID ptVa = HvPtPoolVaFromPa(tablePa);
+    if (!ptVa)
+        return STATUS_UNSUCCESSFUL;
+
+    *PteOut = (volatile UINT64*)ptVa + ((Gpa >> 12) & 0x1FF);
+    return STATUS_SUCCESS;
+}
+
+// ----------------------------------------------------------------------------
+//  SvmSaveEntry — snapshot the current leaf PTE of Gpa into the local core's
+//  tracking block. Read-only: no TLB order is armed and no flush is needed.
+//  The snapshot is the raw 64-bit entry, so a restriction that cleared the
+//  present bit (entry value 0) round-trips losslessly through RestoreEntry.
+// ----------------------------------------------------------------------------
+static NTSTATUS SvmSaveEntry(PPCPU_CONTEXT Cpu, UINT64 Gpa)
+{
+    if (!Cpu || !Cpu->VmcbVa)
+        return STATUS_INVALID_PARAMETER;
+
+    UINT64 pageGpa = Gpa & ~0xFFFULL;
+
+    volatile UINT64* slot = NULL;
+    NTSTATUS status = SvmLocateNptPte(pageGpa, &slot);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_Npt.Lock, &oldIrql);
+
+    Cpu->SavedPteValue     = *slot;
+    Cpu->SingleStepPageGpa = pageGpa;
+
+    KeReleaseSpinLock(&g_Npt.Lock, oldIrql);
+    return STATUS_SUCCESS;
+}
+
+// ----------------------------------------------------------------------------
+//  SvmRelaxPermissions — grant at least Perms on the 4KB leaf translating
+//  Gpa (OR-in semantics: present/read, write, and NX-removal for execute).
+//  This is the re-entry half of NPT single-stepping: after the faulting
+//  access trapped, the page is relaxed so the trapped guest instruction can
+//  execute exactly once before #DB terminates the step.
+//
+//  The PTE edit runs under the short g_Npt.Lock spinlock; the coordinated
+//  TLB invalidation is issued strictly AFTER the lock is released — a core
+//  spinning on g_Npt.Lock cannot service its DPC, and calling the barrier
+//  under the lock would deadlock the flush.
+// ----------------------------------------------------------------------------
+static NTSTATUS SvmRelaxPermissions(PPCPU_CONTEXT Cpu, UINT64 Gpa, UINT64 Perms)
+{
+    if (!Cpu || !Cpu->VmcbVa)
+        return STATUS_INVALID_PARAMETER;
+
+    SvmParkTlbFlushOrder(Cpu);
+
+    UINT64 pageGpa = Gpa & ~0xFFFULL;
+
+    volatile UINT64* slot = NULL;
+    NTSTATUS status = SvmLocateNptPte(pageGpa, &slot);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_Npt.Lock, &oldIrql);
+
+    UINT64 raw = *slot;
+    if (!(raw & NPT_PTE_PRESENT)) {
+        KeReleaseSpinLock(&g_Npt.Lock, oldIrql);
+        return STATUS_NOT_FOUND;
+    }
+
+    // Typed overlay through the dedicated NPT_PTE union (common.h); edits
+    // stay mask-driven on the raw value so behaviour is independent of the
+    // bitfield declaration order in the header.
+    NPT_PTE pte;
+    RtlCopyMemory(&pte, &raw, sizeof(NPT_PTE));
+
+    if (Perms & NPT_PERM_READ)
+        raw |= NPT_PTE_PRESENT;
+    if (Perms & NPT_PERM_WRITE)
+        raw |= NPT_PTE_WRITE;
+    if (Perms & NPT_PERM_EXECUTE)
+        raw &= ~NPT_PTE_NX;
+
+    UNREFERENCED_PARAMETER(pte);
+
+    *slot = raw;
+
+    KeReleaseSpinLock(&g_Npt.Lock, oldIrql);
+
+    // Re-arm the one-shot flush on every core so no stale nested translation
+    // survives the permission change.
+    SvmInvalidateTlbAll(Cpu);
+    return STATUS_SUCCESS;
+}
+
+// ----------------------------------------------------------------------------
+//  SvmRestoreEntry — reinstall the PTE snapshot taken by SvmSaveEntry for
+//  the page recorded in the local core's tracking block, re-tightening the
+//  permission state the single step temporarily relaxed. The tracking block
+//  is cleared only after the restore is committed so a failed walk leaves
+//  the snapshot intact for a retry.
+// ----------------------------------------------------------------------------
+static NTSTATUS SvmRestoreEntry(PPCPU_CONTEXT Cpu)
+{
+    if (!Cpu || !Cpu->VmcbVa)
+        return STATUS_INVALID_PARAMETER;
+
+    if (Cpu->SingleStepPageGpa == 0)
+        return STATUS_UNSUCCESSFUL;     // nothing staged by SvmSaveEntry
+
+    SvmParkTlbFlushOrder(Cpu);
+
+    volatile UINT64* slot = NULL;
+    NTSTATUS status = SvmLocateNptPte(Cpu->SingleStepPageGpa, &slot);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&g_Npt.Lock, &oldIrql);
+
+    *slot = Cpu->SavedPteValue;
+
+    KeReleaseSpinLock(&g_Npt.Lock, oldIrql);
+
+    Cpu->SavedPteValue     = 0;
+    Cpu->SingleStepPageGpa = 0;
+
+    // The re-tightened PTE is invisible until every core's stale translation
+    // dies — re-arm the coordinated one-shot purge.
+    SvmInvalidateTlbAll(Cpu);
+    return STATUS_SUCCESS;
+}
 
 // ============================================================================
 //  VMCB initialisation.
 // ============================================================================
-static NTSTATUS SvmInitializeVmcb(PPER_CPU_CONTEXT Cpu)
+static NTSTATUS SvmInitializeVmcb(PPCPU_CONTEXT Cpu)
 {
     PVMCB vmcb = (PVMCB)Cpu->VmcbVa;
     if (!vmcb)
@@ -523,26 +872,46 @@ static NTSTATUS SvmInitializeVmcb(PPER_CPU_CONTEXT Cpu)
 
     RtlZeroMemory(vmcb, sizeof(VMCB));
 
-    // ---- Control area: intercepts ----
-    // CPUID in Misc1, VMMCALL + VMRUN in Misc2. The VMRUN intercept must be
-    // set (bit 0 of Misc2, i.e. bit 32 of the 64-bit intercept field) or the
-    // processor's VMRUN consistency check aborts with VMEXIT_INVALID (-1)
-    // before any guest instruction executes. #DB interception is mandatory
-    // for single-step and is kept enabled permanently so guest hardware
-    // breakpoints never silently vanish.
+    // ---- Control area: intercept vectors ----
+    //  * CPUID (Misc1)      : guest CPUID must be answered by the VMM so the
+    //                         SVM feature leaf can be shaped.
+    //  * VMMCALL (Misc2)    : hypercall channel (teardown handshake).
+    //  * VMRUN  (Misc2 b0)  : architecturally mandatory — a cleared VMRUN
+    //                         intercept fails the VMRUN consistency check and
+    //                         terminates with VMEXIT_INVALID (-1) before any
+    //                         guest instruction executes.
+    //  * #DB    (exc bit 1) : single-step / hardware-breakpoint delivery; kept
+    //                         permanently armed so guest DR7 breakpoints never
+    //                         silently vanish.
+    //  Deliberately NOT armed:
+    //  * #PF (exc bit 14)   : with nested paging active, guest page faults are
+    //                         resolved entirely by the guest page tables under
+    //                         NPT permissions; intercepting them would push
+    //                         every guest memory operation through #VMEXIT.
+    //  * CR0/CR3/CR4 writes : InterceptCrRead/InterceptCrWrite stay zeroed —
+    //                         NPT decouples guest CR3 from host translation,
+    //                         so CR interception adds exit pressure with no
+    //                         protection benefit while NPT is active.
+    vmcb->Control.InterceptCrRead     = 0;
+    vmcb->Control.InterceptCrWrite    = 0;
     vmcb->Control.InterceptMisc1      |= SVM_INTERCEPT_CPUID;
     vmcb->Control.InterceptMisc2      |= SVM_INTERCEPT_VMMCALL
                                       |  SVM_INTERCEPT_VMRUN;
     vmcb->Control.InterceptExceptions |= SVM_INTERCEPT_DB;
+    vmcb->Control.InterceptExceptions &= ~SVM_INTERCEPT_PF;
 
     // ---- Control area: NPT ----
     vmcb->Control.Asid      = SVM_GUEST_ASID;
     vmcb->Control.NestedCtl = SVM_NPT_ENABLE;
     vmcb->Control.NestedCr3 = NptGetPml4Phys();
 
-    // ---- Control area: TLB flush on first VMRUN ----
-    // Purges any stale ASID-tagged TLB entries left by prior SVM state on
-    // this core, so the first guest entry observes only the current NPT.
+    // ---- Control area: one-shot TLB purge ----
+    // Order 01b makes the FIRST VMRUN on this VMCB flush the entire TLB (all
+    // ASIDs, non-global), discarding stale guest-tagged translations left by
+    // any prior SVM state on this core. The order is consumed by that single
+    // entry; SvmParkTlbFlushOrder parks the field back at 00b from every
+    // subsequent host-side callback so standard VMRUN iterations never force
+    // a comprehensive hardware TLB rebuild.
     vmcb->Control.TlbCtl = SVM_TLBCTL_FLUSH_ALL;
 
     // ---- Control area: MSR bitmap ----
@@ -574,15 +943,23 @@ static NTSTATUS SvmInitializeVmcb(PPER_CPU_CONTEXT Cpu)
     VMCB_SEG gs = {};
     VMCB_SEG tr = {};
 
-    if (!SvmReadSegment(__readcs(), &cs)) return STATUS_UNSUCCESSFUL;
-    if (!SvmReadSegment(__readss(), &ss)) return STATUS_UNSUCCESSFUL;
-    if (!SvmReadSegment(__readds(), &ds)) return STATUS_UNSUCCESSFUL;
-    if (!SvmReadSegment(__reades(), &es)) return STATUS_UNSUCCESSFUL;
-    if (!SvmReadSegment(__readfs(), &fs)) return STATUS_UNSUCCESSFUL;
-    if (!SvmReadSegment(__readgs(), &gs)) return STATUS_UNSUCCESSFUL;
+    if (!SvmSetupSegment(&cs, __readcs(), 1)) return STATUS_UNSUCCESSFUL;
+    if (!SvmSetupSegment(&ss, __readss(), 1)) return STATUS_UNSUCCESSFUL;
+    if (!SvmSetupSegment(&ds, __readds(), 1)) return STATUS_UNSUCCESSFUL;
+    if (!SvmSetupSegment(&es, __reades(), 1)) return STATUS_UNSUCCESSFUL;
+    if (!SvmSetupSegment(&fs, __readfs(), 1)) return STATUS_UNSUCCESSFUL;
+    if (!SvmSetupSegment(&gs, __readgs(), 1)) return STATUS_UNSUCCESSFUL;
 
+    // TR is a 16-byte system descriptor (S=0) in the GDT; the 64-bit TSS
+    // base lives in bytes 8-11 and the type must be 64-bit TSS (9 =
+    // available, 11 = busy).
     UINT16 trSelector = VmxReadTr();
-    if (!SvmReadTssBase(trSelector, &tr)) return STATUS_UNSUCCESSFUL;
+    if (!SvmSetupSegment(&tr, trSelector, 0))
+        return STATUS_UNSUCCESSFUL;
+
+    UINT8 trType = (UINT8)(tr.Attrib & 0x0F);
+    if (trType != 0x9 && trType != 0xB)
+        return STATUS_UNSUCCESSFUL;
 
     // In long mode FS/GS bases live in MSRs; the GDT image is stale.
     fs.Base = __readmsr(MSR_IA32_FS_BASE);
@@ -598,11 +975,11 @@ static NTSTATUS SvmInitializeVmcb(PPER_CPU_CONTEXT Cpu)
 
     // No LDT in the Windows x64 kernel: encode an unusable LDT descriptor
     // (type 2 = LDT, P=1) so VMRUN consistency checks accept the save state.
-    SvmSetupSegment(&vmcb->Save.Ldtr, 0, 0, 0, 0x0082);
+    SvmSetupTableRegister(&vmcb->Save.Ldtr, 0, 0, 0, 0x0082);
 
     // Table registers: base and limit only; the Attrib field is reserved as 0.
-    SvmSetupSegment(&vmcb->Save.Gdtr, 0, gdtr.Base, gdtr.Limit, 0);
-    SvmSetupSegment(&vmcb->Save.Idtr, 0, idtr.Base, idtr.Limit, 0);
+    SvmSetupTableRegister(&vmcb->Save.Gdtr, 0, gdtr.Base, gdtr.Limit, 0);
+    SvmSetupTableRegister(&vmcb->Save.Idtr, 0, idtr.Base, idtr.Limit, 0);
 
     // ---- Save area: RFLAGS, RIP, RSP ----
     // RIP and RSP are overwritten by the launch sequence before VMRUN.
@@ -626,25 +1003,30 @@ static NTSTATUS SvmInitializeVmcb(PPER_CPU_CONTEXT Cpu)
 //     MSR_VM_HSAVE_PA the VMRUN faults (#GP / machine check).
 //  2. Program the VMCB.
 //  3. Set EFER.SVME on this core (EFER is strictly per-logical-processor).
-//  4. Immediately register the HSAVE physical address in MSR_VM_HSAVE_PA
-//     (bits 63:12; bits 11:0 must read zero, which the page-aligned
-//     contiguous allocator guarantees).
+//  4. Register the HSAVE physical address in MSR_VM_HSAVE_PA (bits 63:12;
+//     bits 11:0 must read zero, which the page-aligned contiguous allocator
+//     guarantees).
 //
 //  Launched is deliberately NOT set here — a core is marked launched only
 //  after its launch primitive has completed successfully.
 // ----------------------------------------------------------------------------
 static NTSTATUS SvmSetupCurrentCpu(PVOID /*Context*/)
 {
-    PPER_CPU_CONTEXT cpu = GetCurrentCpu();
+    PCPU_CONTEXT cpu = GetCurrentCpu();
     if (!cpu || !cpu->VmcbVa)
         return STATUS_UNSUCCESSFUL;
 
     if (!cpu->HostSaveVa) {
+        PHYSICAL_ADDRESS lowBoundary  = {};
+        PHYSICAL_ADDRESS highBoundary = {};
+        PHYSICAL_ADDRESS skipBytes    = {};
+        highBoundary.QuadPart = MAXULONG64;
+
         PVOID save = MmAllocateContiguousMemorySpecifyCacheNode(
             PAGE_SIZE,
-            (PHYSICAL_ADDRESS) { 0 },
-            (PHYSICAL_ADDRESS) { MAXULONG64 },
-            (PHYSICAL_ADDRESS) { 0 },
+            lowBoundary,
+            highBoundary,
+            skipBytes,
             MmCached,
             MM_ANY_NODE_OK);
 
@@ -686,7 +1068,7 @@ static NTSTATUS SvmSetupCurrentCpu(PVOID /*Context*/)
 // ----------------------------------------------------------------------------
 static NTSTATUS SvmLaunchCurrentCpu(VOID)
 {
-    PPER_CPU_CONTEXT cpu = GetCurrentCpu();
+    PCPU_CONTEXT cpu = GetCurrentCpu();
     if (!cpu || !cpu->VmcbVa || !cpu->HostSaveVa)
         return STATUS_UNSUCCESSFUL;
 
@@ -711,30 +1093,84 @@ static NTSTATUS SvmLaunchCurrentCpu(VOID)
 // ============================================================================
 //  Teardown.
 // ============================================================================
-#define HV_HYPERCALL_TEARDOWN  0x48566D78ULL   // 'HVmx'
 
 // ----------------------------------------------------------------------------
-//  SvmHandleTeardownVmcall — runs in host context after the guest's VMMCALL
-//  #VMEXIT. The VMCB save area already holds the full guest register state
-//  (VMEXIT stored it in hardware) and the assembler stub owns the bare-metal
-//  host-state restoration loop. VMSAVE must never execute here: from host
-//  mode it writes the live host FS/GS/TR/LDTR values into the VMCB save
-//  area, destroying guest state. CLGI is likewise an asm-layer primitive.
-//  Clearing EFER.SVME fences off any further VMRUN on this core.
+//  SvmHandleTeardownVmcall — runs in host context after the guest's teardown
+//  VMMCALL #VMEXIT. The VMCB save area already holds the guest's RAX, RSP,
+//  RIP and RFLAGS (hardware stored them at exit) while the remaining GPRs
+//  were spilled by the naked stub into its GuestRegs block.
+//
+//  Host-state overwrite vectors eliminated on this path:
+//    * No VMSAVE: from host mode VMSAVE writes the live host FS/GS/TR/LDTR
+//      (and STAR/LSTAR) values into the VMCB save area, destroying guest
+//      state. VMSAVE stays an asm-layer primitive only.
+//    * No CLGI: global interrupt masking belongs to the assembler layer.
+//    * EFER.SVME is cleared first so no further VMRUN can execute and the
+//      HSAVE pointer is unregistered.
+//
+//  The captured guest RIP/RSP/RAX are published into the GuestRegs block so
+//  the stub can restore all guest GPRs and execute a native long-mode jump
+//  back into guest execution outside SVM boundaries. The resume RIP prefers
+//  NextRip: the teardown VMMCALL has architecturally committed, and re-
+//  executing it natively (SVME now clear) would raise #UD. Save.Rip is kept
+//  as the fallback when the NRIPS save is absent.
 // ----------------------------------------------------------------------------
-NTSTATUS SvmHandleTeardownVmcall(PPER_CPU_CONTEXT Cpu)
+extern "C" NTSTATUS SvmHandleTeardownVmcall(UINT64* GuestRegs, PPCPU_CONTEXT Cpu)
 {
     if (!Cpu)
-        return STATUS_SUCCESS;
+        return STATUS_INVALID_PARAMETER;
 
+    if (!GuestRegs) {
+        Cpu->Launched = FALSE;
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    PVMCB vmcb = (PVMCB)Cpu->VmcbVa;
+    if (!vmcb) {
+        Cpu->Launched = FALSE;
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    // 1) Extract the active guest context into stack storage BEFORE any
+    //    host-side MSR or VMCB mutation can touch the save area.
+    const UINT64 guestRip    = vmcb->Save.Rip;
+    const UINT64 guestRsp    = vmcb->Save.Rsp;
+    const UINT64 guestRax    = vmcb->Save.Rax;
+    const UINT64 resumeRip   = (vmcb->Control.NextRip != 0)
+                             ? vmcb->Control.NextRip
+                             : guestRip;
+
+    // 2) De-register the core from the SVM execution plane.
+    Cpu->Launched = FALSE;
+
+    // 3) Disable global virtualization: clear EFER.SVME so VMRUN can no
+    //    longer execute on this logical processor, then unmap the HSAVE
+    //    area from the MSR (required to be re-registered before any future
+    //    relaunch and harmless to clear once SVME is down).
     UINT64 efer = __readmsr(MSR_IA32_EFER);
     if (efer & X86_EFER_SVME)
         __writemsr(MSR_IA32_EFER, efer & ~X86_EFER_SVME);
 
-    Cpu->Launched = FALSE;
+    __writemsr(MSR_AMD_VM_HSAVE_PA, 0);
+
+    // 4) Publish the captured guest context into the naked stub register
+    //    block. The stub restores the full GPR set from GuestRegs (which
+    //    already carries the stub-spilled guest RBX..R15 etc.) merged with
+    //    these VMCB-sourced values, then performs the native long-mode jmp
+    //    back into guest execution.
+    GuestRegs[HV_GUEST_REG_RAX] = guestRax;
+    GuestRegs[HV_GUEST_REG_RSP] = guestRsp;
+    GuestRegs[HV_GUEST_REG_RIP] = resumeRip;
+
     return STATUS_SUCCESS;
 }
 
+// ----------------------------------------------------------------------------
+//  SvmTeardownDpc — pinned teardown trampoline. Issues the teardown
+//  hypercall from the target core; the #VMEXIT handler above performs the
+//  SVM shutdown and the stub resumes this thread natively at the return
+//  address of the VMMCALL.
+// ----------------------------------------------------------------------------
 static VOID SvmTeardownDpc(
     PKDPC Dpc, PVOID DeferredContext, PVOID SystemArgument1, PVOID SystemArgument2)
 {
@@ -743,12 +1179,17 @@ static VOID SvmTeardownDpc(
     UNREFERENCED_PARAMETER(SystemArgument1);
     UNREFERENCED_PARAMETER(SystemArgument2);
 
-    PPER_CPU_CONTEXT cpu = GetCurrentCpu();
+    PCPU_CONTEXT cpu = GetCurrentCpu();
     if (!cpu || !cpu->Launched) return;
 
-    __svm_vmmcall(HV_HYPERCALL_TEARDOWN, 0, 0);
+    __svm_vmmcall((unsigned long)(HV_HYPERCALL_TEARDOWN), 0, 0);
 }
 
+// ----------------------------------------------------------------------------
+//  SvmTeardown — global shutdown. Order matters: cores are detached from SVM
+//  first (no further VMRUN), then per-core allocations are released, then the
+//  NPT pool. The page pool must outlive the NPT release.
+// ----------------------------------------------------------------------------
 static VOID SvmTeardown(VOID)
 {
     InterlockedExchange(&g_ShuttingDown, 1);
@@ -872,60 +1313,129 @@ static NTSTATUS SvmInitialize(VOID)
 // ============================================================================
 
 // ----------------------------------------------------------------------------
-//  Single-step arming toggles RFLAGS.TF in the VMCB save area and records
-//  the pending state atomically in the per-CPU context. The #DB intercept
+//  SvmArmSingleStep — arm RFLAGS.TF in the VMCB save area and record the
+//  pending state atomically in the local core's context. The #DB intercept
 //  is left permanently enabled: clearing it would stop guest DR7 hardware
 //  breakpoints from exiting, silently vanishing them. The exit handler
 //  discriminates the two sources: SingleStepPending marks the debug fault
 //  raised by TF, anything else is a guest breakpoint (DR6/DR7 in the save
 //  area) and is reinjected.
 // ----------------------------------------------------------------------------
-static VOID SvmArmSingleStep(PPER_CPU_CONTEXT Cpu)
+static VOID SvmArmSingleStep(PPCPU_CONTEXT Cpu)
 {
     PVMCB vmcb = (PVMCB)Cpu->VmcbVa;
     if (!vmcb) return;
+
+    SvmParkTlbFlushOrder(Cpu);
 
     Cpu->SingleStepPending = TRUE;
     vmcb->Save.Rflags |= X86_RFLAGS_TF;
 }
 
-static VOID SvmDisarmSingleStep(PPER_CPU_CONTEXT Cpu)
+static VOID SvmDisarmSingleStep(PPCPU_CONTEXT Cpu)
 {
     PVMCB vmcb = (PVMCB)Cpu->VmcbVa;
     if (!vmcb) return;
+
+    SvmParkTlbFlushOrder(Cpu);
 
     vmcb->Save.Rflags &= ~X86_RFLAGS_TF;
     Cpu->SingleStepPending = FALSE;
 }
 
 // ----------------------------------------------------------------------------
-//  SvmInjectException — EVENTINJ programming (APM Vol 2, App. B).
+//  SvmInjectException — defensively hardened EVENTINJ programming (APM Vol 2,
+//  App. B).
 //    bits  7:0   V       exception vector
 //    bits 10:8   Type    3 = hardware exception
 //    bit  11     EV      error code present
 //    bit  31     V^      event valid — consumed by the next VMRUN
 //    bits 63:32  error code
 //  The processor delivers the event at guest entry as if raised natively.
+//
+//  Hardening contract:
+//    * The single EVENTINJ slot must be free: if EXITINTINFO still carries a
+//      valid pending event (or EVENTINJ itself is armed), injection is
+//      rejected with STATUS_UNSUCCESSFUL rather than silently overwriting a
+//      queued event.
+//    * Vectors that architecturally push an error code get the 32-bit code
+//      packed into EVENTINJ bits 63:32 with EV set; the code is delivered
+//      on the guest stack by the microcode event delivery.
+//    * #PF additionally requires the architectural CR2 value: the faulting
+//      guest physical address is written into Vmcb->Save.Cr2 before the
+//      event is armed.
 // ----------------------------------------------------------------------------
-static NTSTATUS SvmInjectException(UINT32 Vector, UINT32 ErrorCode, UINT64 FaultingGpa)
+static NTSTATUS SvmInjectException(PPCPU_CONTEXT Cpu, UINT32 Vector, UINT32 ErrorCode, UINT64 FaultingGpa)
 {
-    UNREFERENCED_PARAMETER(FaultingGpa);
+    if (!Cpu || !Cpu->VmcbVa)
+        return STATUS_INVALID_PARAMETER;
 
-    PPER_CPU_CONTEXT cpu = GetCurrentCpu();
-    if (!cpu || !cpu->VmcbVa)
+    if (Vector > 31)
+        return STATUS_INVALID_PARAMETER;
+
+    PVMCB vmcb = (PVMCB)Cpu->VmcbVa;
+
+    // Reject injection while an event is still pending delivery: EXITINTINFO
+    // valid bit set, or an already-armed EVENTINJ slot.
+    if (vmcb->Control.ExitIntInfo & SVM_EXITINTINFO_VALID)
         return STATUS_UNSUCCESSFUL;
 
-    PVMCB vmcb = (PVMCB)cpu->VmcbVa;
+    if (vmcb->Control.EventInj & SVM_EVENTINJ_VALID)
+        return STATUS_UNSUCCESSFUL;
 
-    UINT64 eventInj = 0;
-    eventInj |= (1ULL << 31);              // valid
-    eventInj |= (3ULL << 8);               // hardware exception
-    eventInj |= (Vector & 0xFF);
+    SvmParkTlbFlushOrder(Cpu);
 
-    if (Vector == 14) {
-        eventInj |= (1ULL << 11);          // error-code valid
-        eventInj |= ((UINT64)ErrorCode << 32);
+    UINT64 eventInj = SVM_EVENTINJ_VALID                    // bit 31: valid
+                    | SVM_EVENTINJ_TYPE_EXCEPTION           // type 3: hardware exception
+                    | (UINT64)(Vector & 0xFF);              // bits 7:0: vector
+
+    // Vectors that architecturally require an error code (#DF, #TS, #NP,
+    // #SS, #GP, #PF, #AC, #CP, #VC, #SX): pack the 32-bit code into the
+    // upper half of the 64-bit control field and mark EV.
+    static const BOOLEAN needsErrorCode[32] = {
+        FALSE, // 0  #DE
+        FALSE, // 1  #DB
+        FALSE, // 2  NMI
+        FALSE, // 3  #BP
+        FALSE, // 4  #OF
+        FALSE, // 5  #BR
+        FALSE, // 6  #UD
+        FALSE, // 7  #NM
+        TRUE,  // 8  #DF
+        FALSE, // 9  reserved
+        TRUE,  // 10 #TS
+        TRUE,  // 11 #NP
+        TRUE,  // 12 #SS
+        TRUE,  // 13 #GP
+        TRUE,  // 14 #PF
+        FALSE, // 15 reserved
+        FALSE, // 16 #MF
+        TRUE,  // 17 #AC
+        FALSE, // 18 #MC
+        FALSE, // 19 #XF
+        FALSE, // 20 reserved
+        TRUE,  // 21 #CP
+        FALSE, // 22 reserved
+        FALSE, // 23 reserved
+        FALSE, // 24 reserved
+        FALSE, // 25 reserved
+        FALSE, // 26 reserved
+        FALSE, // 27 reserved
+        FALSE, // 28 reserved
+        TRUE,  // 29 #VC
+        TRUE,  // 30 #SX
+        FALSE, // 31 reserved
+    };
+
+    if (needsErrorCode[Vector]) {
+        eventInj |= SVM_EVENTINJ_ERROR_CODE_VALID;
+        eventInj |= ((UINT64)ErrorCode << SVM_EVENTINJ_ERROR_CODE_SHIFT);
     }
+
+    // #PF delivers its fault address through CR2, not through the event
+    // payload: stage the faulting guest physical address in the save area.
+    if (Vector == 14)
+        vmcb->Save.Cr2 = FaultingGpa;
 
     vmcb->Control.EventInj = eventInj;
     return STATUS_SUCCESS;
