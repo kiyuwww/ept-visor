@@ -1,163 +1,125 @@
 <div align="center">
 
-# ⚡ Lowest Level Dev: Bare-Metal Virtualization & Hypervisor Framework
+```
+             _       _            
+ _   _  ___ (_)   __| | _____   __
+| | | |/ _ \| |  / _` |/ _ \ \ / /
+| |_| | (_) | | | (_| |  __/\ V / 
+ \__, |\___/|_|  \__,_|\___| \_/  
+ |___/                            
 
-[![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
-[![Architecture](https://img.shields.io/badge/Architecture-x86__64-orange.svg)]()
-[![Platform](https://img.shields.io/badge/Platform-Kernel--Mode%20%2F%20Bare--Metal-red.svg)]()
-[![License](https://img.shields.io/badge/License-MIT-green.svg)]()
+   L O W - L E V E L   R I N G   H Y P E R V I S O R
+```
 
-*Высокопроизводительный низкоуровневый фреймворк гипервизора типа 1/1.5 для архитектур x86-64, разработанный для исследований в области безопасности ядра, анализа виртуализации и разработки собственного Virtual Machine Monitor (VMM).*
+### **Bare-Metal x86-64 Hardware Virtualization Framework**
+
+*A low-level research hypervisor implementing Intel VT-x and AMD-V virtualization primitives.*
+
+[![C++20](https://img.shields.io/badge/Language-C%2B%2B20%20%2F%20ASM-00599C.svg?style=for-the-badge&logo=cplusplus)](https://isocpp.org/)
+[![Arch](https://img.shields.io/badge/Architecture-x86__64-red.svg?style=for-the-badge)](https://en.wikipedia.org/wiki/X86-64)
+[![Status](https://img.shields.io/badge/Status-In_Active_Development-orange.svg?style=for-the-badge)](#-project-status)
+[![License](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](LICENSE)
+
+---
 
 </div>
 
----
-
-## 📑 Содержание
-
-- [Обзоры и Архитектура](#-обзор-и-архитектура)
-- [Ключевые Возможности](#-ключевые-возможности)
-- [Структура Репозитория](#-структура-репозитория)
-- [Детали Реализации](#-детали-реализации)
-  - [Intel VT-x & EPT](#1-intel-vt-x--ept-extended-page-tables)
-  - [AMD-V & NPT](#2-amd-v--npt-nested-page-tables)
-  - [Диспетчер VM-Exit](#3-диспетчер-перехватов-vm-exit)
-- [Требования и Сборка](#-требования-и-сборка)
-- [Сценарии Применения](#-сценарии-применения)
-- [Дисклеймер](#-отказ-от-ответственности)
+> [!CAUTION]
+> **DEVELOPMENT STAGE (WIP)**
+> This codebase contains experimental, ring--1 kernel-level hypervisor code. It is currently under **heavy active development** (`lowest-level-dev`) and is not yet production-ready. Features may change rapidly.
 
 ---
 
-## 🔬 Обзор и Архитектура
+## ⚡ Overview
 
-Проект **Lowest Level Dev** представляет собой модульную программную платформу, реализующую аппаратную виртуализацию на уровне ring -1 / VMX Root Operation. Фреймворк предоставляет базовую инфраструктуру для инициализации гипервизора, настройки трансляции страниц второго уровня (SLAT) и перехвата событий операционной системы с минимальными накладными расходами (overhead).
-
-Проект сфокусирован на прозрачной виртуализации уже запущенной операционной системы (Late Launch / Dynamic Hypervisor Elevation).
+This project is a lightweight, high-performance C++ and Assembly hypervisor engine designed for low-level research into hardware-assisted virtualization. By interfacing directly with host hardware extensions (**Intel VT-x** and **AMD-V**), it creates a transparent virtualization layer underneath the operating system.
 
 ```
-                      +-------------------------------+
-                      |      Guest OS / Ring 0-3      |
-                      +-------------------------------+
-                                      |
-                         (VM-Exit / Intercept)
-                                      v
-   +---------------------------------------------------------------------+
-   |                      LOWEST LEVEL DEV HYPERVISOR                    |
-   |                                                                     |
-   |   +--------------------------+         +------------------------+   |
-   |   |    Intel VMX Subsystem   |         |   AMD SVM Subsystem    |   |
-   |   |   (intel_vmm.cpp / asm)  |         |     (amd_svm.cpp)      |   |
-   |   +--------------------------+         +------------------------+   |
-   |                |                                    |               |
-   |                v                                    v               |
-   |   +--------------------------+         +------------------------+   |
-   |   |   Extended Page Tables   |         |   Nested Page Tables   |   |
-   |   |    (ept_common.cpp)      |         |     (amd_npt.cpp)      |   |
-   |   +--------------------------+         +------------------------+   |
-   |                                                                     |
-   |                  +--------------------------------+                 |
-   |                  |   VM-Exit Handler (vmexit.cpp) |                 |
-   |                  +--------------------------------+                 |
-   +---------------------------------------------------------------------+
-                                      |
-                                      v
-                      +-------------------------------+
-                      |       Hardware (x86_64)       |
-                      +-------------------------------+
+       +-------------------------------------------------------+
+       |                  GUEST OS / USER SPACE                |
+       +-------------------------------------------------------+
+                                  |
+                           ( VM-Exit / VM-Entry )
+                                  v
++---------------------------------------------------------------------+
+|                      KLEHypervisor Core                             |
+|  +--------------------------------+  +---------------------------+  |
+|  |     Intel VMX Subsystem        |  |    AMD SVM Subsystem      |  |
+|  |  - EPT Page Tables             |  |  - NPT Page Tables        |  |
+|  |  - VMCS Execution Control      |  |  - VMCB State Control     |  |
+|  +--------------------------------+  +---------------------------+  |
+|                                                                     |
+|                  VM-Exit Dispatcher & Handler Pipeline              |
++---------------------------------------------------------------------+
+                                  |
+                                  v
+       +-------------------------------------------------------+
+       |                  HOST HARDWARE (x86-64)               |
+       +-------------------------------------------------------+
 ```
 
 ---
 
-## ✨ Ключевые Возможности
+## ✨ Core Architectures Supported
 
-* **Dual-Vendor Support**: Полная поддержка аппаратных технологий виртуализации **Intel VT-x** и **AMD-V (SVM)**.
-* **SLAT (Second Level Address Translation)**:
-  * Реализация **EPT (Extended Page Tables)** для процессоров Intel.
-  * Реализация **NPT (Nested Page Tables)** для процессоров AMD.
-  * Возможность изоляции, подмены и мониторинга страниц физической памяти.
-* **Высокооптимизированный Context Switching**:
-  * Ассемблерные заглушки (`intel_vmm_stub.asm`) для мгновенного сохранения и восстановления регистров процессора при переходах `VM-Exit` $\rightarrow$ `VM-Resume`.
-* **Гибкий Диспетчер Перехватов**:
-  * Перехват и обработка инструкций `CPUID`, `CR3/CR0/CR4 Access`, `MSR Read/Write`, `INVD`, `VMCALL / VMMCALL` и др.
-* **Модульная Низкоуровневая Архитектура**:
-  * Минимальное количество внешних зависимостей, идеальный выбор для работы в среде ядра (Kernel-mode) или Bare-Metal.
+### 🔷 Intel VT-x Subsystem
+* **VMX Initialization (`intel_vmm.cpp`)**: Full control structure setup, VMXON region activation, and VMCS configuration.
+* **Extended Page Tables (`ept_common.cpp`)**: Memory translation virtualization via 4-level nested identity maps.
+* **Low-Level Assembly Stubs (`intel_vmm_stub.asm`)**: Host context preservation, VMLANCH / VMRESUME primitives, and low-overhead context switches.
 
----
+### 🔴 AMD-V Subsystem
+* **SVM Engine (`amd_svm.cpp`)**: Host state save area layout, MSRPM setup, and VMCB construction.
+* **Nested Page Tables (`amd_npt.cpp`)**: Hardware-accelerated memory virtualization for AMD processor nodes.
+* **SVM Assembly Stubs (`amd_svm_stub.asm`)**: High-speed VMRUN loops and host register state save/restore routines.
 
-## 📁 Структура Репозитория
-
-| Файл | Назначение |
-| :--- | :--- |
-| `intel_vmm.cpp` | Логика входа в режим VMX, инициализация VMCS (Virtual Machine Control Structure), настройка контрольных регистров Intel. |
-| `intel_vmm_stub.asm` | Ассемблерные точки входа для обработки переходов `VMLAUNCH`, `VMRESUME` и низкоуровневого сохранения контекста. |
-| `ept_common.cpp` | Создание и управление иерархией таблиц страниц EPT (PML4, PDPT, PD, PT), настройка разрешений (Read/Write/Execute). |
-| `amd_svm.cpp` | Подготовка структуры VMCB (Virtual Machine Control Block), инициализация SVM и переключение процессоров AMD в режим виртуализации. |
-| `amd_npt.cpp` | Построение и обслуживание двухэтапной адресации NPT для архитектуры AMD. |
-| `vmexit.cpp` | Главный диспетчер обработки событий выходов из виртуального режима (VM-Exit dispatcher). |
-| `common.h` | Общие структуры данных, определения MSR-регистров, флаги CPUID, макросы и утилиты. |
+### 🛡️ VM-Exit Handling Core
+* **Event Dispatcher (`vmexit.cpp`)**: Intercepts CPU execution events (MSR access, CPUID queries, CR3 loads, EPT/NPT faults) and safely dispatches or passes through context state.
 
 ---
 
-## 🔍 Детали Реализации
+## 📁 Repository Structure
 
-### 1. Intel VT-x & EPT (`intel_vmm.cpp`, `ept_common.cpp`)
-Инициализация включает в себя проверку флагов `CPUID.1:ECX.VMX[bit 5]`, включение `CR4.VMXE`, настройку MSR-регистров (`IA32_FEATURE_CONTROL`, `IA32_VMX_BASIC`) и выделение физически непрерывной памяти под `VMXON` и `VMCS` области. Таблицы EPT формируют прямую (identity) карту памяти с возможностью настройки флагов доступа $R/W/X$ для каждой страницы 4KB/2MB.
-
-### 2. AMD-V & NPT (`amd_svm.cpp`, `amd_npt.cpp`)
-Для процессоров AMD выполняется проверка `CPUID.80000001h:ECX.SVM[bit 2]`, настройка `EFER.SVME` и инициализация `VMCB`. Управление памятью осуществляется через вложенные таблицы NPT, обеспечивая аппаратный проброс адресов и контроль за обращениями к памяти.
-
-### 3. Диспетчер Перехватов (`vmexit.cpp`)
-При возникновении события перехвата управление передается в ассемблерный стаб, который сохраняет регистры общего назначения ($RAX, RBX, RCX, RDX, RSI, RDI, RBP, R8-R15$) и вызывает C++ функцию `VmExitHandler`. 
-
-Пример логики обработки:
-```cpp
-// Концептуальный пример обработки VM-Exit
-extern "C" void MainVmExitHandler(GuestContext* context) {
-    auto exitReason = ReadVmcs(VM_EXIT_REASON);
-
-    switch (exitReason) {
-        case EXIT_REASON_CPUID:
-            HandleCpuid(context);
-            AdvanceInstructionPointer();
-            break;
-        case EXIT_REASON_MSR_READ:
-            HandleMsrRead(context);
-            AdvanceInstructionPointer();
-            break;
-        case EXIT_REASON_EPT_VIOLATION:
-            HandleEptViolation(context);
-            break;
-        default:
-            // Неизвестное или необрабатываемое событие
-            InjectGeneralProtectionFault(context);
-            break;
-    }
-}
+```tree
+lowest-level-dev/
+├── 🔷 Intel Subsystem
+│   ├── intel_vmm.cpp        # VMX Virtual Machine Monitor initialization
+│   ├── intel_vmm_stub.asm   # Intel context switch & VMLAUNCH assembly stubs
+│   └── ept_common.cpp       # Extended Page Table (EPT) memory handlers
+│
+├── 🔴 AMD Subsystem
+│   ├── amd_svm.cpp          # AMD SVM VMCB configuration & runtime setup
+│   ├── amd_svm_stub.asm     # AMD low-level VMRUN assembly primitives
+│   └── amd_npt.cpp          # AMD Nested Page Tables (NPT) implementation
+│
+├── ⚙️ Shared Core
+│   ├── vmexit.cpp           # Centralized VM-Exit handler & event pipeline
+│   └── common.h             # Shared type definitions, registers, & structures
 ```
 
 ---
 
-## 🛠 Требования и Сборка
+## 🛠️ Prerequisites & Building
 
-### Системные требования
-* **Процессор**: x86-64 Intel (с поддержкой VT-x & EPT) или AMD (с поддержкой AMD-V & NPT).
-* **Включенная виртуализация** в BIOS/UEFI (SVM / Intel Virtualization Technology).
-
-### Инструменты сборки
-* **Компилятор**: Visual Studio (MSVC 2019/2022) с установленным WDK (если сборка идет под драйвер ядра) или Clang/GCC.
-* **Ассемблер**: Microsoft Macro Assembler (MASM / `ml64.exe`) или NASM для сборки `intel_vmm_stub.asm`.
-* **Стандарт C++**: C++17 или новее.
+### Requirements
+* **Compiler**: Modern C++ compiler with C++20 support (`GCC >= 10`, `Clang >= 12`, or `MSVC 2022`)
+* **Assembler**: NASM / MASM for `.asm` context-switching stubs
+* **Target OS**: x86-64 System with CPU Virtualization enabled in BIOS/UEFI (VT-x or AMD-V)
 
 ---
 
-## 🎯 Сценарии Применения
+## 🚧 Active Development Roadmap
 
-1. **Исследования в области безопасности**: Анализ поведения вредоносного ПО (Malware Analysis) в изолированной гипервизором среде.
-2. **Разработка Hypervisor-based Anti-Cheat / Security Agents**: Мониторинг целостности памяти ядра и защиты критических структур данных OS.
-3. **Образовательные цели**: Изучение внутреннего устройства низкоуровневой виртуализации, спецификаций Intel SDM (Volume 3C) и AMD Architecture Programmer's Manual (Volume 2).
+The framework is actively being built and refined. Current milestones include:
+
+- [x] Basic Intel VMXON & VMLAUNCH pipelines
+- [x] AMD SVM VMCB control setup & VMRUN loop
+- [ ] Complete EPT / NPT page fault hook resolution
+- [ ] Custom MSR & CPUID interception handlers
+- [ ] Multi-core hypervisor initialization (SMP support)
+- [ ] Stability testing across bare-metal environments
 
 ---
 
-## ⚠️ Отказ от ответственности
+## 📄 License
 
-*Данный проект создан исключительно в образовательных и исследовательских целях. Неправильное использование низкоуровневых инструкций виртуализации или неверная работа с физической памятью может привести к сбою системы (BSOD / Kernel Panic).*
+Distributed under the MIT License. See `LICENSE` for more information.
